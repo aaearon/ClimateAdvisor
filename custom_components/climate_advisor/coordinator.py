@@ -15,7 +15,7 @@ import hashlib
 import logging
 import math
 import statistics
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -40,6 +40,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import log_capture
+from .ai_backend import CREDENTIAL_ACCOUNT, get_provider
 from .automation import (
     NAT_VENT_START_PREDICTION,
     AutomationEngine,
@@ -73,6 +74,7 @@ from .confirmed_transition import is_confirmed, resolve_candidate_since
 from .const import (
     _VENT_SPLIT_TYPES,
     AC_WHF_OVERLAP_TOLERANCE_S,
+    AI_ACCOUNT_HASS_KEY,
     ATTR_AI_STATUS,
     ATTR_AUTOMATION_STATUS,
     ATTR_BRIEFING,
@@ -112,8 +114,9 @@ from .const import (
     COMFORT_STALL_MARGIN_F,
     COMFORT_STALL_REMINDER_SECONDS,
     COMFORT_STALL_SUSTAIN_SECONDS,
-    CONF_AI_API_KEY,
     CONF_AI_ENABLED,
+    CONF_AI_MODEL,
+    CONF_AI_PROVIDER,
     CONF_AUTOMATION_GRACE_PERIOD,
     CONF_BRIEFING_NOTIFICATIONS_ENABLED,
     CONF_FAN_ENTITY,
@@ -142,6 +145,7 @@ from .const import (
     DAY_TYPE_HOT,
     DAY_TYPE_MILD,
     DAY_TYPE_WARM,
+    DEFAULT_AI_PROVIDER,
     DEFAULT_AUTOMATION_GRACE_SECONDS,
     DEFAULT_COMFORT_COOL,
     DEFAULT_COMFORT_HEAT,
@@ -842,7 +846,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self.ai_skills: AISkillRegistry | None = None
         self._investigation_report_history: list[dict] = []
         self._ai_client_config: dict[str, Any] | None = None
-        if config.get(CONF_AI_ENABLED) and config.get(CONF_AI_API_KEY):
+        if config.get(CONF_AI_ENABLED) and self._ai_credentials_present(config):
             from .ai_skills import AISkillRegistry as _AISkillRegistry
             from .ai_skills_investigator import register_investigator_skill
 
@@ -859,7 +863,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             _LOGGER.debug(
                 "AI subsystem disabled — enabled: %s, key present: %s",
                 config.get(CONF_AI_ENABLED, False),
-                bool(config.get(CONF_AI_API_KEY)),
+                self._ai_credentials_present(config),
             )
 
         # Startup safety — first update checks HVAC state before applying classification
@@ -1921,6 +1925,58 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         return _wrapped
 
+    @staticmethod
+    def _ai_credentials_present(config: dict[str, Any]) -> bool:
+        """AI gate: an unknown provider (status "error"), an account provider, or a set API key.
+
+        An account provider (ChatGPT) needs no key: an unconnected zone still gets a client, which
+        reports not-connected until the shared account manager has credentials (no reload needed).
+        """
+        from .ai_providers import ensure_providers_registered  # noqa: PLC0415
+
+        ensure_providers_registered()
+        spec = get_provider(config.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
+        if spec is None:
+            return True
+        return spec.credential_kind == CREDENTIAL_ACCOUNT or bool(config.get(spec.credential_setting))
+
+    def _ai_client_arg(self, config: dict[str, Any]) -> Any:
+        """What the provider's backend is given: the loaded shared manager for an account provider, else None."""
+        spec = get_provider(config.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
+        return self.hass.data.get(AI_ACCOUNT_HASS_KEY) if spec and spec.credential_kind == CREDENTIAL_ACCOUNT else None
+
+    async def async_apply_ai_settings(self, data: Mapping[str, Any]) -> None:
+        """Apply this zone's saved ``ai_*`` settings to the running coordinator and client, without a reload.
+
+        The account-provider steps of the options flow call this: signing in and choosing a model is
+        finished only when an investigation can use it. Every other setting waits for a reload (Issue
+        #573). ``self.config`` is updated in place because the client holds the same dict, the way
+        ``async_persist_model_fallback`` reaches it.
+        """
+        self.config.update({key: value for key, value in data.items() if key.startswith("ai_")})
+        if not self.config.get(CONF_AI_ENABLED) or not self._ai_credentials_present(self.config):
+            return
+        if self.ai_skills is None:
+            from .ai_skills import AISkillRegistry as _AISkillRegistry
+            from .ai_skills_investigator import register_investigator_skill
+
+            self.ai_skills = _AISkillRegistry()
+            register_investigator_skill(self.ai_skills)
+        client_arg = self._ai_client_arg(self.config)
+        # Building a backend may do blocking I/O (see __init__), so it runs in the executor; the swap
+        # itself stays on the loop, so a request being dispatched sees the old provider or the new one.
+        client = self.claude_client
+        if client is None:
+            from .claude_api import ClaudeAPIClient as _ClaudeAPIClient
+
+            self.claude_client = await self._executor_job(functools.partial(_ClaudeAPIClient, self.config, client_arg))
+            return
+        spec = get_provider(self.config.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
+        backend = None
+        if spec is not None and spec.id != client.provider_id:
+            backend = await self._executor_job(functools.partial(spec.build_backend, self.config, client_arg))
+        client.update_config(self.config, client_arg, backend=backend)
+
     async def async_restore_state(self) -> None:
         """Restore operational state from disk after startup."""
         _LOGGER.info("Climate Advisor v%s starting up", VERSION)
@@ -1928,8 +1984,21 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         if ai_client_config is not None:
             from .claude_api import ClaudeAPIClient as _ClaudeAPIClient
 
-            self.claude_client = await self._executor_job(functools.partial(_ClaudeAPIClient, ai_client_config))
-            _LOGGER.info("AI subsystem initialized — model: %s", ai_client_config.get("ai_model", "unknown"))
+            # Account providers get the already-loaded shared manager by plain reference (read here on
+            # the event loop; the executor only constructs). API-key providers keep client=None.
+            spec = get_provider(ai_client_config.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
+            manager = self._ai_client_arg(ai_client_config)
+            try:
+                self.claude_client = await self._executor_job(
+                    functools.partial(_ClaudeAPIClient, ai_client_config, manager)
+                )
+            except Exception:  # noqa: BLE001 - an AI failure must never fail setup (HVAC keeps running)
+                _LOGGER.exception("AI subsystem could not be initialized; continuing without AI")
+                self.claude_client = None
+            _LOGGER.info(
+                "AI subsystem initialized — model: %s",
+                ai_client_config.get(spec.model_setting if spec else CONF_AI_MODEL, "unknown"),
+            )
             self._ai_client_config = None
         # Issue #543: chart_log.load() does blocking file I/O — offload to executor.
         await self._executor_job(self._chart_log.load)
@@ -2449,9 +2518,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         immediately so this doesn't need a full integration reload. Silent + logged
         (WARNING) — no user-facing notification, per design decision.
         """
-        from .const import CONF_AI_MODEL  # noqa: PLC0415
-
-        old_model = self.config.get(CONF_AI_MODEL, "")
+        spec = get_provider(self.config.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
+        model_key = spec.model_setting if spec else CONF_AI_MODEL
+        old_model = self.config.get(model_key, "")
         if not self._entry_id:
             _LOGGER.warning(
                 "AI model auto-migrated %s -> %s (previous model no longer available), "
@@ -2459,7 +2528,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 old_model,
                 new_model,
             )
-            self.config[CONF_AI_MODEL] = new_model
+            self.config[model_key] = new_model
             return
 
         entry = self.hass.config_entries.async_get_entry(self._entry_id)
@@ -2472,9 +2541,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             )
             return
 
-        new_data = {**entry.data, CONF_AI_MODEL: new_model}
+        new_data = {**entry.data, model_key: new_model}
         self.hass.config_entries.async_update_entry(entry, data=new_data)
-        self.config[CONF_AI_MODEL] = new_model
+        self.config[model_key] = new_model
         _LOGGER.warning(
             "AI model auto-migrated: %s -> %s (previous model no longer available)",
             old_model,

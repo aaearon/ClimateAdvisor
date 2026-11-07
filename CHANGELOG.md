@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [Unreleased]
+
+- Feat #1: the AI Investigator can now run on a ChatGPT subscription instead of a Claude API key (preview). Choose the provider per zone under Configure, AI Settings; Claude stays the default and existing installs are unchanged. Sign-in happens inside Home Assistant with no SSH or file copying: pick Sign in with ChatGPT, agree to the privacy notice, open the link, and paste the address of the page that fails to load afterwards (it starts with `http://127.0.0.1`; the failure is expected). One account is shared by all zones; only an administrator can sign in or disconnect, and only the user who signed in can run investigations. The sign-in is stored in Home Assistant's `.storage` and is included in backups (restoring an old backup asks you to sign in again). If a usage limit is reached, every zone pauses ChatGPT requests for an hour. Known limits: this paste-the-address sign-in is not documented by OpenAI and has not yet had a live sign-in, there is no fallback route, and the OpenAI access it relies on is a preview that may change. The panel and live requests have not yet had a real-world run.
+
 ## [0.8.71] — 2026-11-06
 
 - Fix #1389: a Home Assistant restart no longer turns off the whole-house fan that is cooling the house through open windows. A door/window sensor reads "unavailable" from the shutdown until it loads on the next start (a group helper waits for its members, about 1.5 minutes on the production install). Climate Advisor counted it as closed after 60 s, while Home Assistant was still starting, so it called the house sealed, sent the fan off and e-mailed "door/window sensor unavailable". The 60 s now starts once Home Assistant has finished starting. A sensor that is still dark a minute after that is still counted closed, as before, so a fan on a really sealed house is still stopped.

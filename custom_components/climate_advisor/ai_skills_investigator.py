@@ -626,7 +626,7 @@ def investigation_fallback(coordinator: Any, **kwargs: Any) -> dict[str, Any]:
         "errors_warnings": (
             "\n".join(errors_parts) if errors_parts else "No errors or warnings in the supplied window."
         ),
-        "hypotheses": "AI unavailable — hypotheses require cross-source analysis by Claude.",
+        "hypotheses": "AI unavailable — hypotheses require cross-source analysis by the AI provider.",
         "recommended_actions": "Restore AI connectivity and re-run the full investigator skill.",
         "assumptions": "Fallback only scans deterministic patterns; deep inference was not performed.",
         "full_text": "",
