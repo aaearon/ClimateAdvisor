@@ -10,13 +10,17 @@ from, and a zone is defined by its thermostat. So each report goes to the zone t
 only one zone, everything goes to it. A report that can't be placed goes to no zone. The original file is
 always kept whole as a backup, so nothing is lost either way.
 
+One attempt per Home Assistant run: the first AI zone to start makes it, and every other zone waits for it before
+loading (zones with AI off hold no reports in memory). So no zone has loaded when zone files are written, and none
+can overwrite them from a stale in-memory list, which is what a retry during the run would allow. After a failed
+attempt, zones run on their own files and the next start migrates and merges.
+
 Remaining window: the zone files can't be replaced as one atomic step and there are no tombstones. If the process
 stops or a replace fails while they are being replaced, or the shared file can't be removed afterwards, some zone
 files are already live while the shared file remains. A report deleted from one of them before the next start is
-merged back by the retry.
+merged back by that start's attempt.
 
-Blocking I/O: run in the executor. Zones set up concurrently; the first one to get here does the work for all
-of them under `INVESTIGATION_REPORTS_LOCK`, and the rest then find no shared file.
+Blocking I/O: run in the executor.
 """
 
 from __future__ import annotations
@@ -40,9 +44,8 @@ _LOGGER = logging.getLogger(__name__)
 
 LEGACY_BACKUP_STEM = "climate_advisor_investigation_reports_legacy_shared"
 
-# Held for the whole migration and for every zone's report save. Not reentrant: nothing that holds it may take it
-# again, and it blocks, so executor threads only, never the event loop.
-INVESTIGATION_REPORTS_LOCK = threading.Lock()
+_ATTEMPTED_KEY = "climate_advisor_report_migration_attempted"
+_ATTEMPT_LOCK = threading.Lock()
 
 # The two places the investigator context names its thermostat: build_hvac_entity_context() in
 # ai_skills_context.py and render_diagnostic_snapshot_text() in diagnostic_snapshot.py.
@@ -132,8 +135,20 @@ def _write_backup(config_dir: Path, data: bytes) -> Path:
     raise AssertionError("unreachable")
 
 
+def migrate_shared_reports_once(run_state: dict[str, Any], config_dir: Path, zones: dict[str, str | None]) -> None:
+    """Make this run's one migration attempt, or wait for the one in progress. Returns once no attempt is running.
+
+    `run_state` is `hass.data`, so the gate lasts as long as the Home Assistant run and survives zone reloads.
+    """
+    with _ATTEMPT_LOCK:
+        if run_state.get(_ATTEMPTED_KEY):
+            return
+        run_state[_ATTEMPTED_KEY] = True
+        migrate_shared_reports(config_dir, zones)
+
+
 def migrate_shared_reports(config_dir: Path, zones: dict[str, str | None]) -> None:
-    """Split the shared reports file between zones, then replace it with a backup. Safe to call on every start.
+    """Split the shared reports file between zones, then replace it with a backup. Harmless if there is none.
 
     `zones` maps every configured entry_id to its thermostat, including zones not set up yet. In order: parse every
     target zone file, write the backup, stage every zone's merged content in a synced temp file, replace the zone
@@ -141,55 +156,54 @@ def migrate_shared_reports(config_dir: Path, zones: dict[str, str | None]) -> No
     start repeats the work (merging by timestamp, so repeating adds no duplicates).
     """
     legacy_path = config_dir / INVESTIGATION_REPORTS_FILE
-    with INVESTIGATION_REPORTS_LOCK:
-        if not zones or not legacy_path.exists():
-            return
-        try:
-            data = legacy_path.read_bytes()
-        except OSError as err:
-            _LOGGER.warning("Could not read shared investigation reports file, will retry next start: %s", err)
-            return
+    if not zones or not legacy_path.exists():
+        return
+    try:
+        data = legacy_path.read_bytes()
+    except OSError as err:
+        _LOGGER.warning("Could not read shared investigation reports file, will retry next start: %s", err)
+        return
 
-        try:
-            reports = json.loads(data)
-            if not isinstance(reports, list):
-                raise ValueError("not a list")
-        except ValueError as err:
-            _LOGGER.warning("Shared investigation reports file is unreadable (%s), setting it aside", err)
-            reports = []
+    try:
+        reports = json.loads(data)
+        if not isinstance(reports, list):
+            raise ValueError("not a list")
+    except ValueError as err:
+        _LOGGER.warning("Shared investigation reports file is unreadable (%s), setting it aside", err)
+        reports = []
 
-        split = _split_by_zone(reports, zones)
-        staged: list[tuple[str, Path]] = []
-        try:
-            targets = {
-                resolve_entry_scoped_path(config_dir, INVESTIGATION_REPORTS_FILE, entry_id): zone_reports
-                for entry_id, zone_reports in split.items()
-            }
-            merged = {path: _merged_zone_reports(path, zone_reports) for path, zone_reports in targets.items()}
-            backup_path = _write_backup(config_dir, data)
-            for path, content in merged.items():
-                staged.append((_stage_zone_file(path, content), path))
-            while staged:
-                os.replace(staged[0][0], staged[0][1])
-                staged.pop(0)
-        except (OSError, ValueError) as err:
-            _LOGGER.error("Could not migrate shared investigation reports, will retry next start: %s", err)
-            return
-        finally:
-            for tmp_path, _ in staged:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
+    split = _split_by_zone(reports, zones)
+    staged: list[tuple[str, Path]] = []
+    try:
+        targets = {
+            resolve_entry_scoped_path(config_dir, INVESTIGATION_REPORTS_FILE, entry_id): zone_reports
+            for entry_id, zone_reports in split.items()
+        }
+        merged = {path: _merged_zone_reports(path, zone_reports) for path, zone_reports in targets.items()}
+        backup_path = _write_backup(config_dir, data)
+        for path, content in merged.items():
+            staged.append((_stage_zone_file(path, content), path))
+        while staged:
+            os.replace(staged[0][0], staged[0][1])
+            staged.pop(0)
+    except (OSError, ValueError) as err:
+        _LOGGER.error("Could not migrate shared investigation reports, will retry next start: %s", err)
+        return
+    finally:
+        for tmp_path, _ in staged:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
-        placed = sum(len(r) for r in split.values())
-        if placed < len(reports):
-            _LOGGER.warning(
-                "%d of %d investigation reports could not be assigned to a zone; they are kept in %s",
-                len(reports) - placed,
-                len(reports),
-                backup_path.name,
-            )
-        _LOGGER.info("Moved %d investigation reports to %d zones; backup: %s", placed, len(split), backup_path.name)
-        try:
-            legacy_path.unlink()
-        except OSError as err:
-            _LOGGER.warning("Could not remove shared investigation reports file after migrating: %s", err)
+    placed = sum(len(r) for r in split.values())
+    if placed < len(reports):
+        _LOGGER.warning(
+            "%d of %d investigation reports could not be assigned to a zone; they are kept in %s",
+            len(reports) - placed,
+            len(reports),
+            backup_path.name,
+        )
+    _LOGGER.info("Moved %d investigation reports to %d zones; backup: %s", placed, len(split), backup_path.name)
+    try:
+        legacy_path.unlink()
+    except OSError as err:
+        _LOGGER.warning("Could not remove shared investigation reports file after migrating: %s", err)

@@ -15,6 +15,7 @@ import hashlib
 import logging
 import math
 import statistics
+import threading
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -306,7 +307,7 @@ from .invariant_watchdog import (
     run_promise_checks,
     run_promise_excused,
 )
-from .investigation_report_migration import INVESTIGATION_REPORTS_LOCK, migrate_shared_reports
+from .investigation_report_migration import migrate_shared_reports_once
 from .learning import (
     SHUTDOWN_KIND_HA_STOP,
     SHUTDOWN_KIND_UNLOAD,
@@ -843,6 +844,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self.claude_client: ClaudeAPIClient | None = None
         self.ai_skills: AISkillRegistry | None = None
         self._investigation_report_history: list[dict] = []
+        self._investigation_report_save_lock = threading.Lock()
         self._ai_client_config: dict[str, Any] | None = None
         if config.get(CONF_AI_ENABLED) and config.get(CONF_AI_API_KEY):
             from .ai_skills import AISkillRegistry as _AISkillRegistry
@@ -2515,7 +2517,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         if not self._entry_id:
             return
         try:
-            migrate_shared_reports(Path(self.hass.config.config_dir), zones)
+            migrate_shared_reports_once(self.hass.data, Path(self.hass.config.config_dir), zones)
         except Exception:
             _LOGGER.exception("Failed to migrate legacy investigation reports")
 
@@ -2527,19 +2529,21 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         filepath = self._investigation_reports_path()
         tmp_path = filepath + ".tmp"
-        try:
-            with INVESTIGATION_REPORTS_LOCK:
+        # Saves in a zone can overlap and share tmp_path. Copying inside the lock means the last save writes the newest
+        # list; the event loop changes the list while this runs, and list() is atomic against that.
+        with self._investigation_report_save_lock:
+            try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(self._investigation_report_history, f, indent=2, default=str)
+                    json.dump(list(self._investigation_report_history), f, indent=2, default=str)
                 if sys.platform != "win32":
                     os.chmod(tmp_path, 0o600)
                 os.replace(tmp_path, filepath)
-        except Exception:
-            _LOGGER.exception("Failed to save investigation reports to %s", filepath)
-            import contextlib
+            except Exception:
+                _LOGGER.exception("Failed to save investigation reports to %s", filepath)
+                import contextlib
 
-            with contextlib.suppress(OSError):
-                os.remove(tmp_path)
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
 
     def _load_investigation_reports(self) -> None:
         """Load investigation report history from disk."""

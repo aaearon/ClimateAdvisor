@@ -10,7 +10,7 @@ import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from unittest.mock import MagicMock
 
 import pytest
@@ -32,6 +32,7 @@ def _hass(config_dir: Path) -> MagicMock:
     hass.config.config_dir = str(config_dir)
     hass.config.path = lambda *parts: str(config_dir.joinpath(*parts))
     hass.async_add_executor_job = _run_inline
+    hass.data = {}
     return hass
 
 
@@ -42,6 +43,7 @@ def _zone(config_dir: Path, entry_id: str, climate_entity: str = "climate.any"):
     coord._entry_id = entry_id
     coord.config = {"climate_entity": climate_entity}
     coord._investigation_report_history = []
+    coord._investigation_report_save_lock = Lock()
     coord._load_investigation_reports()
     return coord
 
@@ -83,6 +85,46 @@ class TestZonesKeepTheirOwnReports:
         assert _texts(_zone(tmp_path, "entry_a")) == []
         assert _texts(_zone(tmp_path, "entry_b")) == ["report B", "report B2"]
 
+    def test_overlapping_saves_in_one_zone_keep_the_file_valid_and_the_deletion(self, tmp_path, monkeypatch):
+        """Occupant impact: a delete during another save can't corrupt the history or bring the report back."""
+        zone = _zone(tmp_path, "entry_a")
+        now = datetime.now(UTC)
+        zone._investigation_report_history = [
+            {"timestamp": (now - timedelta(hours=2)).isoformat(), "result": {"text": "keep"}},
+            {"timestamp": (now - timedelta(hours=1)).isoformat(), "result": {"text": "gone"}},
+        ]
+        real_dump = json.dump
+        first_save_writing, release_first_save = Event(), Event()
+
+        def _hold_first_save(*args, **kwargs):
+            if not first_save_writing.is_set():
+                first_save_writing.set()
+                release_first_save.wait(timeout=5)
+            real_dump(*args, **kwargs)
+
+        monkeypatch.setattr(json, "dump", _hold_first_save)
+        first = Thread(target=zone._save_investigation_reports)
+        second = Thread(target=zone._save_investigation_reports)
+
+        first.start()
+        assert first_save_writing.wait(timeout=5)
+        assert zone.delete_investigation_report(zone._investigation_report_history[1]["timestamp"]) is True
+        second.start()
+        # Unfixed, the second save finishes here and the first then writes over it. Fixed, it waits, so this
+        # bounded wait only delays the test and can't fail it.
+        second.join(timeout=0.2)
+        release_first_save.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        monkeypatch.undo()
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        saved = json.loads(_scoped(tmp_path, "entry_a").read_text())
+        assert [e["result"]["text"] for e in saved] == ["keep"]
+        assert _texts(_zone(tmp_path, "entry_a")) == ["keep"]
+        assert not list(tmp_path.glob("*.tmp"))
+
 
 # ---------------------------------------------------------------------------
 # Migration of the old shared file
@@ -114,6 +156,19 @@ def _scoped(config_dir: Path, entry_id: str) -> Path:
 def _scoped_texts(config_dir: Path, entry_id: str) -> list[str]:
     path = _scoped(config_dir, entry_id)
     return [e["result"]["text"] for e in json.loads(path.read_text())] if path.exists() else []
+
+
+def _fail_staging_for(monkeypatch, entry_id: str) -> None:
+    import custom_components.climate_advisor.investigation_report_migration as migration
+
+    real_mkstemp = migration.tempfile.mkstemp
+
+    def _mkstemp(*args, **kwargs):
+        if entry_id in kwargs.get("prefix", ""):
+            raise OSError("disk full")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(migration.tempfile, "mkstemp", _mkstemp)
 
 
 class TestReportThermostat:
@@ -295,23 +350,11 @@ class TestMigrateSharedReports:
         assert _scoped_texts(tmp_path, "entry_b") == ["2"]
         assert not (tmp_path / INVESTIGATION_REPORTS_FILE).exists()
 
-    def _fail_staging_for(self, monkeypatch, entry_id: str) -> None:
-        import custom_components.climate_advisor.investigation_report_migration as migration
-
-        real_mkstemp = migration.tempfile.mkstemp
-
-        def _mkstemp(*args, **kwargs):
-            if entry_id in kwargs.get("prefix", ""):
-                raise OSError("disk full")
-            return real_mkstemp(*args, **kwargs)
-
-        monkeypatch.setattr(migration.tempfile, "mkstemp", _mkstemp)
-
     def test_failed_later_zone_write_leaves_earlier_zone_files_unchanged(self, tmp_path, monkeypatch):
         existing = json.dumps([_report("9", "climate.a")])
         _scoped(tmp_path, "entry_a").write_text(existing)
         original = _write_legacy(tmp_path, [_report("1", "climate.a"), _report("2", "climate.b")])
-        self._fail_staging_for(monkeypatch, "entry_b")
+        _fail_staging_for(monkeypatch, "entry_b")
 
         self._migrate(tmp_path)
 
@@ -342,7 +385,7 @@ class TestMigrateSharedReports:
         shared_a = {**_report("1", "climate.a"), "timestamp": older}
         _scoped(tmp_path, "entry_a").write_text(json.dumps([own]))
         _write_legacy(tmp_path, [shared_a, _report("2", "climate.b")])
-        self._fail_staging_for(monkeypatch, "entry_b")
+        _fail_staging_for(monkeypatch, "entry_b")
         self._migrate(tmp_path)
         monkeypatch.undo()
 
@@ -357,46 +400,6 @@ class TestMigrateSharedReports:
 
         assert not set(deleted) & set(_scoped_texts(tmp_path, "entry_a"))
         assert _scoped_texts(tmp_path, "entry_b") == ["2"]
-        assert not (tmp_path / INVESTIGATION_REPORTS_FILE).exists()
-
-    def test_save_racing_a_staged_retry_survives(self, tmp_path, monkeypatch):
-        """Occupant impact: a report stored while another zone retries the migration is not overwritten."""
-        import custom_components.climate_advisor.investigation_report_migration as migration
-
-        _scoped(tmp_path, "entry_a").write_text(json.dumps([]))
-        original = _write_legacy(tmp_path, [_report("1", "climate.a")])
-        zone_a = _zone(tmp_path, "entry_a")
-        zone_a._investigation_report_history.append(
-            {
-                "timestamp": datetime.now(UTC).isoformat(),
-                "report_type": "investigation",
-                "result": {"text": "saved during staging"},
-            }
-        )
-        real_stage = migration._stage_zone_file
-        save_finished = Event()
-
-        def _save_then_finish() -> None:
-            zone_a._save_investigation_reports()
-            save_finished.set()
-
-        save_thread = Thread(target=_save_then_finish)
-
-        def _stage_after_racing_save(path, content):
-            # The snapshot is already taken. Without the lock the save lands now and is then replaced; with it,
-            # the save waits, so this bounded wait only ever delays the migration and can't fail the fixed code.
-            save_thread.start()
-            save_finished.wait(timeout=0.5)
-            return real_stage(path, content)
-
-        monkeypatch.setattr(migration, "_stage_zone_file", _stage_after_racing_save)
-
-        self._migrate(tmp_path)
-        save_thread.join(timeout=5)
-
-        assert not save_thread.is_alive(), "save deadlocked on the migration lock"
-        assert "saved during staging" in _scoped_texts(tmp_path, "entry_a")
-        assert (tmp_path / _BACKUP).read_bytes() == original
         assert not (tmp_path / INVESTIGATION_REPORTS_FILE).exists()
 
     def test_a_zone_file_that_cannot_be_read_is_not_overwritten(self, tmp_path):
@@ -443,14 +446,17 @@ class TestMigrateSharedReports:
         from concurrent.futures import ThreadPoolExecutor
         from threading import Barrier
 
+        from custom_components.climate_advisor.investigation_report_migration import migrate_shared_reports_once
+
         zones = {f"entry_{i}": f"climate.z{i}" for i in range(8)}
         reports = [_report(str(i + 1), f"climate.z{i}") for i in range(8)]
         original = _write_legacy(tmp_path, reports)
         barrier = Barrier(8)
+        run_state: dict = {}
 
         def _start_zone() -> None:
             barrier.wait()
-            self._migrate(tmp_path, zones)
+            migrate_shared_reports_once(run_state, tmp_path, zones)
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             for future in [pool.submit(_start_zone) for _ in range(8)]:
@@ -473,6 +479,104 @@ class TestMigrateSharedReports:
         assert (tmp_path / _BACKUP).exists()
 
 
+class TestOneAttemptPerRun:
+    """A retry during a run would write the file of a zone already loaded, and its next save would undo that."""
+
+    def _start_zone(self, config_dir: Path, entry_id: str, run_state: dict):
+        """What async_restore_state() does: the migration step, then the load."""
+        zone = _zone(config_dir, entry_id)
+        zone.hass.data = run_state
+        zone._migrate_legacy_investigation_reports(_ZONES)
+        zone._load_investigation_reports()
+        return zone
+
+    def test_failed_attempt_waits_for_the_next_start_and_then_loses_nothing(self, tmp_path, monkeypatch):
+        """Occupant impact: a failed upgrade step costs no report, old or new, once Home Assistant restarts."""
+        recent = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        shared_a = {**_report("1", "climate.a"), "timestamp": recent}
+        shared_b = {**_report("2", "climate.b"), "timestamp": recent}
+        original = _write_legacy(tmp_path, [shared_a, shared_b])
+
+        first_run: dict = {}
+        _fail_staging_for(monkeypatch, "entry_b")
+        zone_a = self._start_zone(tmp_path, "entry_a", first_run)
+        monkeypatch.undo()
+        assert _texts(zone_a) == []
+
+        # Neither another zone's setup nor a reload of A may retry during this run.
+        self._start_zone(tmp_path, "entry_b", first_run)
+        zone_a = self._start_zone(tmp_path, "entry_a", first_run)
+        assert (tmp_path / INVESTIGATION_REPORTS_FILE).read_bytes() == original
+        assert not _scoped(tmp_path, "entry_a").exists()
+        assert not _scoped(tmp_path, "entry_b").exists()
+
+        asyncio.run(zone_a.async_store_investigation_report({"text": "new report"}))
+
+        second_run: dict = {}
+        assert sorted(_texts(self._start_zone(tmp_path, "entry_a", second_run))) == ["1", "new report"]
+        assert _texts(self._start_zone(tmp_path, "entry_b", second_run)) == ["2"]
+        assert not (tmp_path / INVESTIGATION_REPORTS_FILE).exists()
+        assert (tmp_path / _BACKUP).read_bytes() == original
+
+    def test_an_attempt_that_raises_is_not_repeated_in_the_same_run(self, tmp_path, monkeypatch):
+        import custom_components.climate_advisor.investigation_report_migration as migration
+
+        calls = []
+
+        def _boom(*args):
+            calls.append(args)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(migration, "migrate_shared_reports", _boom)
+        run_state: dict = {}
+
+        with pytest.raises(RuntimeError):
+            migration.migrate_shared_reports_once(run_state, tmp_path, _ZONES)
+        migration.migrate_shared_reports_once(run_state, tmp_path, _ZONES)
+
+        assert len(calls) == 1
+
+    def test_runs_do_not_share_the_gate(self, tmp_path):
+        from custom_components.climate_advisor.investigation_report_migration import migrate_shared_reports_once
+
+        migrate_shared_reports_once({}, tmp_path, _ZONES)
+        _write_legacy(tmp_path, [_report("1", "climate.a")])
+
+        migrate_shared_reports_once({}, tmp_path, _ZONES)
+
+        assert _scoped_texts(tmp_path, "entry_a") == ["1"]
+
+    def test_a_zone_waits_until_the_attempt_in_progress_has_finished(self, tmp_path, monkeypatch):
+        """If a zone could load during another zone's attempt, its next save would undo that attempt."""
+        import custom_components.climate_advisor.investigation_report_migration as migration
+
+        started, release = Event(), Event()
+        calls = []
+
+        def _held_attempt(*args):
+            calls.append(args)
+            started.set()
+            release.wait(timeout=5)
+
+        monkeypatch.setattr(migration, "migrate_shared_reports", _held_attempt)
+        run_state: dict = {}
+        first = Thread(target=migration.migrate_shared_reports_once, args=(run_state, tmp_path, _ZONES))
+        second = Thread(target=migration.migrate_shared_reports_once, args=(run_state, tmp_path, _ZONES))
+
+        first.start()
+        assert started.wait(timeout=5)
+        second.start()
+        second.join(timeout=0.2)
+        assert second.is_alive()
+
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(calls) == 1
+
+
 class TestCoordinatorMigrationStep:
     def test_storage_failure_is_logged_not_raised_into_setup(self, tmp_path, monkeypatch, caplog):
         """Occupant impact: a report-storage problem must never stop HVAC automation from starting."""
@@ -480,7 +584,7 @@ class TestCoordinatorMigrationStep:
         def _boom(*args):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(coordinator_module, "migrate_shared_reports", _boom)
+        monkeypatch.setattr(coordinator_module, "migrate_shared_reports_once", _boom)
         zone = _zone(tmp_path, "entry_a")
 
         zone._migrate_legacy_investigation_reports({"entry_a": "climate.a"})

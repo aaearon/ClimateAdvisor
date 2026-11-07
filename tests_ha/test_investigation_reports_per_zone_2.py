@@ -42,7 +42,7 @@ def _report(hours_ago: int, thermostat: str) -> dict:
     }
 
 
-async def _setup_two_zones(hass: HomeAssistant, tmp_path: Path) -> list[MockConfigEntry]:
+async def _setup_two_zones(hass: HomeAssistant, tmp_path: Path, *, ai: bool = True) -> list[MockConfigEntry]:
     hass.config.config_dir = str(tmp_path)
     seed = next(e for e in json.loads(_SEED.read_text(encoding="utf-8"))["data"]["entries"] if e["domain"] == DOMAIN)
     today = dt_util.start_of_local_day()
@@ -69,7 +69,7 @@ async def _setup_two_zones(hass: HomeAssistant, tmp_path: Path) -> list[MockConf
             "heat",
             {"hvac_modes": ["off", "heat"], "hvac_action": "idle", "current_temperature": 70, "temperature": 70},
         )
-        data = {**seed["data"], "climate_entity": thermostat, CONF_AI_ENABLED: True, CONF_AI_API_KEY: "test"}
+        data = {**seed["data"], "climate_entity": thermostat, CONF_AI_ENABLED: ai, CONF_AI_API_KEY: "test"}
         entry = MockConfigEntry(
             domain=DOMAIN, version=seed["version"], minor_version=seed.get("minor_version", 1), data=data
         )
@@ -103,6 +103,25 @@ async def test_zones_starting_together_each_get_their_own_old_reports(hass: Home
     assert _history(hass, entries[1]) == ["climate.b"]
     assert not legacy.exists()
     assert (tmp_path / _BACKUP).read_bytes() == original
+    await _unload(hass, entries)
+
+
+async def test_zone_first_enabling_ai_later_in_the_run_makes_the_attempt(hass: HomeAssistant, tmp_path) -> None:
+    """Zones with AI off hold no reports in memory, so the first AI zone can still split the file for everyone."""
+    legacy = tmp_path / INVESTIGATION_REPORTS_FILE
+    legacy.write_text(json.dumps([_report(3, "climate.a"), _report(2, "climate.b")]))
+
+    entries = await _setup_two_zones(hass, tmp_path, ai=False)
+    assert legacy.exists()
+
+    hass.config_entries.async_update_entry(entries[0], data={**entries[0].data, CONF_AI_ENABLED: True})
+    assert await hass.config_entries.async_reload(entries[0].entry_id)
+    await hass.async_block_till_done()
+
+    assert _history(hass, entries[0]) == ["climate.a"]
+    assert not legacy.exists()
+    zone_b_file = tmp_path / f"climate_advisor_investigation_reports_{entries[1].entry_id}.json"
+    assert [e["result"]["text"] for e in json.loads(zone_b_file.read_text())] == ["climate.b"]
     await _unload(hass, entries)
 
 

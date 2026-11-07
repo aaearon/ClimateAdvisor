@@ -359,13 +359,17 @@ are the same bug in three files, not three distinct designs.
     later shared file differs; never overwritten, never deleted by the integration,
     safe for the user to delete). That is the only home of unplaced reports, and a
     warning logs their count.
-  - The first zone to get there splits the file for all configured zones under a
-    process-wide lock. The others wait, then find no shared file, so concurrent
-    setup is safe and each zone's load sees its reports.
+  - One attempt per Home Assistant run, gated in `hass.data`: the first AI zone to
+    start splits the file for all configured zones, and every other zone waits for
+    it before loading. Zones with AI off hold no reports in memory, so a zone that
+    first enables AI later in the run can still make the attempt. There is no retry
+    during a run, because it would write the file of a zone already loaded and that
+    zone's next save would overwrite it.
   - Order: parse every target zone file, write the backup, stage each zone's merged
     content in a synced temp file, replace the zone files, unlink the shared file.
     A failure before the replacing leaves every zone file untouched, the shared file
-    stays, and the next start repeats the work, merging by timestamp. A corrupt shared
+    stays, and the next Home Assistant start repeats the work, merging by timestamp
+    with whatever the zones saved meanwhile. A corrupt shared
     file is moved to the backup name. Errors are logged, never raised into setup.
     The remaining window is described in `docs/state-persistence.md`.
 
