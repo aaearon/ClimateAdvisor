@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [Unreleased]
+
+- Fix #2: each zone now keeps its own AI Report History. Before, all zones shared one file, so a report on one zone could disappear after a restart, another zone's reports could show up in its history, and a deleted report could come back. On upgrade, each existing report moves to the zone whose thermostat produced it. A report that can't be matched to a zone is no longer listed, but it is kept with all the others in `climate_advisor_investigation_reports_legacy_shared.json` in your config folder.
+
 ## [0.8.71] — 2026-11-06
 
 - Fix #1389: a Home Assistant restart no longer turns off the whole-house fan that is cooling the house through open windows. A door/window sensor reads "unavailable" from the shutdown until it loads on the next start (a group helper waits for its members, about 1.5 minutes on the production install). Climate Advisor counted it as closed after 60 s, while Home Assistant was still starting, so it called the house sealed, sent the fan off and e-mailed "door/window sensor unavailable". The 60 s now starts once Home Assistant has finished starting. A sensor that is still dark a minute after that is still counted closed, as before, so a fan on a really sealed house is still stopped.

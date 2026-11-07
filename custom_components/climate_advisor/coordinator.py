@@ -306,6 +306,7 @@ from .invariant_watchdog import (
     run_promise_checks,
     run_promise_excused,
 )
+from .investigation_report_migration import INVESTIGATION_REPORTS_LOCK, migrate_shared_reports
 from .learning import (
     SHUTDOWN_KIND_HA_STOP,
     SHUTDOWN_KIND_UNLOAD,
@@ -350,6 +351,7 @@ from .scheduler import (
 )
 from .setpoint_combinations import vacation_edges
 from .state import StatePersistence
+from .storage_paths import resolve_entry_scoped_path
 from .swing import (
     build_swing_audit_record,
     coast_feed,
@@ -1947,6 +1949,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # Issue #1356: investigation reports are their own file, not part of the state file, so they load on
         # every restore -- including the one with no state file at all (before the `if not state` return).
         if self.claude_client:
+            await self._executor_job(self._migrate_legacy_investigation_reports, self._investigation_report_zones())
             await self._executor_job(self._load_investigation_reports)
 
         if not state:
@@ -2493,20 +2496,44 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         ]
         return len(self._investigation_report_history) < before
 
+    def _investigation_reports_path(self) -> str:
+        """This zone's own reports file (aaearon/ClimateAdvisor#2)."""
+        config_dir = Path(self.hass.config.config_dir)
+        return str(resolve_entry_scoped_path(config_dir, INVESTIGATION_REPORTS_FILE, self._entry_id))
+
+    def _investigation_report_zones(self) -> dict[str, str | None]:
+        """Every configured zone's thermostat, for the shared-file migration. Event loop only."""
+        try:
+            entries = self.hass.config_entries.async_entries(DOMAIN, include_ignore=False)
+            return {e.entry_id: e.data.get("climate_entity") for e in entries}
+        except Exception:
+            _LOGGER.exception("Failed to list zones for the legacy investigation reports migration")
+            return {}
+
+    def _migrate_legacy_investigation_reports(self, zones: dict[str, str | None]) -> None:
+        """Split the old shared reports file between zones. Logged, never raised into setup."""
+        if not self._entry_id:
+            return
+        try:
+            migrate_shared_reports(Path(self.hass.config.config_dir), zones)
+        except Exception:
+            _LOGGER.exception("Failed to migrate legacy investigation reports")
+
     def _save_investigation_reports(self) -> None:
         """Save investigation report history to disk (atomic write)."""
         import json
         import os
         import sys
 
-        filepath = self.hass.config.path(INVESTIGATION_REPORTS_FILE)
+        filepath = self._investigation_reports_path()
         tmp_path = filepath + ".tmp"
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self._investigation_report_history, f, indent=2, default=str)
-            if sys.platform != "win32":
-                os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, filepath)
+            with INVESTIGATION_REPORTS_LOCK:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(self._investigation_report_history, f, indent=2, default=str)
+                if sys.platform != "win32":
+                    os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, filepath)
         except Exception:
             _LOGGER.exception("Failed to save investigation reports to %s", filepath)
             import contextlib
@@ -2518,7 +2545,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         """Load investigation report history from disk."""
         import json
 
-        filepath = self.hass.config.path(INVESTIGATION_REPORTS_FILE)
+        filepath = self._investigation_reports_path()
         try:
             with open(filepath, encoding="utf-8") as f:
                 data = json.load(f)
