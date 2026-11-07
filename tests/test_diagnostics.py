@@ -206,7 +206,7 @@ class TestRedaction:
             arg = key_node.args[0]
             if isinstance(arg, ast.Name) and arg.id == "key_field":  # spec.credential_setting, per provider
                 ensure_providers_registered()
-                password_keys |= {spec.credential_setting for spec in PROVIDERS.values()}
+                password_keys |= {spec.credential_setting for spec in PROVIDERS.values() if spec.credential_setting}
             elif isinstance(arg, ast.Name):
                 password_keys.add(getattr(const_mod, arg.id))
             elif isinstance(arg, ast.Attribute):

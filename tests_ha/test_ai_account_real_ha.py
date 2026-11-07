@@ -30,7 +30,7 @@ from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.climate_advisor import ai_account
 from custom_components.climate_advisor.ai_account import (
-    ACCOUNT_DATA_KEY,
+    AI_ACCOUNT_HASS_KEY,
     REAUTH_ISSUE_ID,
     REVOCATION_CONFIRMED,
     STATE_CONNECTED,
@@ -125,7 +125,7 @@ def _serve_auth(aioclient_mock, token_body: dict | None = None, jwks: dict | Non
 
 def _restart(hass) -> None:
     """Forget the manager; only the file remains."""
-    manager = hass.data.pop(ACCOUNT_DATA_KEY, None)
+    manager = hass.data.pop(AI_ACCOUNT_HASS_KEY, None)
     if manager is not None:
         manager.async_cancel_runtime_tasks()
 
@@ -352,7 +352,7 @@ class TestRealStore:
         aioclient_mock.post(REVOKE_URL, text="")
         assert await async_remove_account(hass) == REVOCATION_CONFIRMED
         assert not _store_file(config_dir).exists()
-        assert ACCOUNT_DATA_KEY not in hass.data
+        assert AI_ACCOUNT_HASS_KEY not in hass.data
         posted = aioclient_mock.mock_calls[-1][2]
         assert posted == {"token": REFRESH, "token_type_hint": "refresh_token", "client_id": CLIENT_ID}
 
@@ -366,7 +366,6 @@ class TestRealRemovalThatCannotDelete:
         self, hass, config_dir, aioclient_mock
     ):
         manager = await _connected(hass, aioclient_mock)
-        old_host = manager.host_id
         _serve_auth(aioclient_mock)
         aioclient_mock.post(REVOKE_URL, status=500)
         manager._store.async_remove = AsyncMock(side_effect=OSError("delete failed"))
@@ -379,8 +378,7 @@ class TestRealRemovalThatCannotDelete:
         new = await asyncio.wait_for(async_get_account_manager(hass), 5)
         assert new is not manager
         assert new.status()["state"] == STATE_DISCONNECTED
-        assert new.host_id and new.host_id != old_host
-        assert _on_disk(config_dir)["data"]["host_id"] == new.host_id
+        assert new.host_id is None  # a new one on the next sign-in, never the removed one
         new.async_cancel_runtime_tasks()
 
     async def test_delete_and_overwrite_both_failing_leaves_the_record_and_says_so(
@@ -393,7 +391,7 @@ class TestRealRemovalThatCannotDelete:
         manager._store.async_remove = AsyncMock(side_effect=OSError("delete failed"))
         with patch("homeassistant.helpers.storage.write_utf8_file_atomic", side_effect=WriteError("disk full")):
             assert await asyncio.wait_for(async_remove_account(hass), 5) == REVOCATION_CONFIRMED
-        assert ACCOUNT_DATA_KEY not in hass.data
+        assert AI_ACCOUNT_HASS_KEY not in hass.data
         assert REFRESH in _store_file(config_dir).read_text(encoding="utf-8")
         assert STORAGE_KEY in caplog.text and "by hand" in caplog.text
         assert REFRESH not in caplog.text and ACCESS not in caplog.text

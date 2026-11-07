@@ -1,8 +1,9 @@
 """ChatGPT-plan (Sign in with ChatGPT) AIBackend for the Responses route.
 
 Talks to ``https://api.openai.com/v1`` only (never ``chatgpt.com/backend-api``) over aiohttp.
-Only a ``response.completed`` event is success: failed, incomplete or interrupted streams
-raise before the final ``stop`` event so no partial report is ever stored. Tokens come from
+Only a ``response.completed`` event with text is success: failed, incomplete, unreadable,
+refused, empty or interrupted streams raise before the final ``stop`` event so no partial or
+blank report is ever stored. Tokens come from
 the shared account manager (injected) and are never logged or placed in exception text.
 Retry/breaker/rate-limit policy lives in ``ClaudeAPIClient``; the only retry here is a
 bounded backoff on HTTP 503. A 429 is never retried: only the documented plan-limit code
@@ -12,6 +13,7 @@ bounded backoff on HTTP 503. A 429 is never retried: only the documented plan-li
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -20,6 +22,7 @@ from typing import Any
 
 import aiohttp
 
+from .ai_account import _error_code, _get_session
 from .ai_backend import CREDENTIAL_ACCOUNT, PROVIDERS, AIBackendError, ProviderSpec
 from .const import CONF_AI_CHATGPT_MODEL
 
@@ -43,18 +46,10 @@ QUOTA_CODES = frozenset({USAGE_LIMIT_CODE})
 RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "slow_down", "rate_limit_error"})
 TRANSIENT_CODES = frozenset({"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable"})
 
+_NOT_BOUND: Any = object()  # a backend not taken for one request (the model list, the readiness probe)
+
 MAX_503_RETRIES = 2
 BACKOFF_SECONDS = (1.0, 3.0)
-
-
-def _exc_types(*names: str) -> tuple[type[BaseException], ...]:
-    """aiohttp exception classes that are real exception types (guards against test stubs)."""
-    found = [getattr(aiohttp, n, None) for n in names]
-    return tuple(t for t in found if isinstance(t, type) and issubclass(t, BaseException))
-
-
-# Must stay: the stubbed tests/ tier has a non-exception aiohttp.ClientError (real aiohttp: tests_ha).
-_NET_ERRORS = (*_exc_types("ClientError"), asyncio.TimeoutError, OSError)
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=900, connect=30, sock_read=300)
 MODELS_TIMEOUT = aiohttp.ClientTimeout(total=30)
@@ -86,16 +81,6 @@ def _safe(value: Any) -> str | None:
     if isinstance(value, str) and 0 < len(value) <= 80 and all(c.isalnum() or c in "_-.:" for c in value):
         return value
     return None
-
-
-def _error_code(payload: Any) -> str | None:
-    """Docs show error as a string, ``error.code``, or only ``{"detail": ...}``."""
-    if not isinstance(payload, dict):
-        return None
-    err = payload.get("error")
-    if isinstance(err, dict):
-        return _safe(err.get("code")) or _safe(err.get("type"))
-    return _safe(err) or _safe(payload.get("code"))
 
 
 def _shape(payload: Any) -> str:
@@ -133,7 +118,11 @@ def _classify_stream_error(code: str | None) -> str:
 
 
 async def _iter_sse(content: Any) -> AsyncIterator[dict[str, Any]]:
-    """Yield parsed SSE events. A block without its terminating blank line is dropped (may be truncated)."""
+    """Yield parsed SSE events; a frame that is not a JSON object is yielded as ``_malformed``.
+
+    Comments, event-only blocks, empty data and ``[DONE]`` are keepalive/framing and yield nothing.
+    A block without its terminating blank line is dropped (may be truncated).
+    """
     event_name: str | None = None
     data: list[str] = []
     async for raw in content:
@@ -141,7 +130,7 @@ async def _iter_sse(content: Any) -> AsyncIterator[dict[str, Any]]:
         if not line:
             if data:
                 payload = "\n".join(data)
-                if payload != "[DONE]":
+                if payload.strip() and payload != "[DONE]":
                     try:
                         parsed = json.loads(payload)
                     except ValueError:
@@ -162,11 +151,28 @@ async def _iter_sse(content: Any) -> AsyncIterator[dict[str, Any]]:
             data.append(value[1:] if value.startswith(" ") else value)
 
 
-def _get_session(hass: Any) -> Any:
-    """Shared aiohttp session; imported lazily because backends are built in the executor."""
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+def _declined(request_id: str | None) -> ChatGPTBackendError:
+    """A refusal. The model's own text is never placed in an exception, which reaches the logs."""
+    return ChatGPTBackendError(
+        "ChatGPT declined to answer this request", "permanent", no_retry=True, no_answer=True, request_id=request_id
+    )
 
-    return async_get_clientsession(hass)
+
+_REFUSAL_MARKER = "refusal"
+
+
+def _completed_text(response: dict[str, Any], rid: str | None) -> str:
+    """Text of a completed response's output; a refusal anywhere in it is an error."""
+    content = [
+        c
+        for item in response.get("output") or []
+        if isinstance(item, dict)
+        for c in item.get("content") or []
+        if isinstance(c, dict)
+    ]
+    if any(c.get("type") == "refusal" for c in content):
+        raise _declined(rid)
+    return "".join(c.get("text", "") for c in content if c.get("type") == "output_text")
 
 
 class ChatGPTBackend:
@@ -184,9 +190,29 @@ class ChatGPTBackend:
         self._config = config
         self.client: Any = client
         self._hass = hass if hass is not None else getattr(client, "hass", None)
+        self._bound_account: Any = _NOT_BOUND
+
+    def for_request(self) -> ChatGPTBackend:
+        """A copy for one request, bound to the account that holds the manager right now."""
+        bound = copy.copy(self)
+        bound._bound_account = self._manager_account()
+        return bound
+
+    def _check_bound_account(self) -> None:
+        """A request never goes out on credentials other than those it started with."""
+        if self._bound_account is not _NOT_BOUND and self._manager_account() != self._bound_account:
+            raise ChatGPTBackendError(
+                "The ChatGPT account changed while this request was running; it was stopped",
+                "auth",
+                no_retry=True,
+            )
 
     # --- manager seam -------------------------------------------------------------
+    def _manager_account(self) -> Any:
+        return self.client.account_identity
+
     async def _manager_token(self, force_refresh: bool = False) -> str:
+        self._check_bound_account()
         try:
             return await self.client.async_get_access_token(force_refresh=force_refresh)
         except AIBackendError as exc:
@@ -208,21 +234,16 @@ class ChatGPTBackend:
             ) from None
 
     def _manager_cooldown_active(self) -> bool:
-        check = getattr(self.client, "quota_cooldown_active", None)
-        return bool(check()) if callable(check) else False
+        return bool(self.client.quota_cooldown_active())
 
-    def _manager_quota_epoch(self) -> int | None:
-        return getattr(self.client, "quota_epoch", None)
+    def _manager_quota_epoch(self) -> int:
+        return self.client.quota_epoch
 
     def _manager_note_success(self, started_epoch: int | None) -> None:
-        note = getattr(self.client, "note_request_succeeded", None)
-        if callable(note):
-            note(started_epoch)
+        self.client.note_request_succeeded(started_epoch)
 
     def _manager_set_cooldown(self, error_code: str | None) -> None:
-        setter = getattr(self.client, "set_quota_cooldown", None)
-        if callable(setter):
-            setter(error_code)
+        self.client.set_quota_cooldown(error_code)
 
     # --- AIBackend ----------------------------------------------------------------
     @property
@@ -256,9 +277,17 @@ class ChatGPTBackend:
         """Build the error for a non-2xx response without echoing the body."""
         status = resp.status
         rid = _safe(resp.headers.get("x-request-id"))
+        if 300 <= status < 400:  # never followed: the prompt and token go to the API host only
+            return ChatGPTBackendError(
+                _describe(f"ChatGPT {stage} was redirected", status, None, rid),
+                "permanent",
+                no_retry=True,
+                status=status,
+                request_id=rid,
+            )
         try:
             payload = json.loads(await resp.read())
-        except (ValueError, *_NET_ERRORS):
+        except ValueError, aiohttp.ClientError, OSError:
             payload = None
         code = _error_code(payload)
         shape = _shape(payload)
@@ -283,15 +312,17 @@ class ChatGPTBackend:
         """Return an entered response context for a 2xx; raises ChatGPTBackendError otherwise.
 
         401: refresh once only if the code is not a known non-credential code, then classify the
-        second answer by its own code. 503: bounded backoff. Everything else is not retried.
+        second answer by its own code. 503: bounded backoff. A redirect is an error, never followed.
+        Everything else is not retried.
         Callers must ``await ctx.__aexit__`` via ``_release``.
         """
         refreshed = False
         retries_503 = 0
         token = await self._manager_token()
         while True:
+            self._check_bound_account()
             headers = self._headers(token, stream=body is not None)
-            kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
+            kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout, "allow_redirects": False}
             if body is not None:
                 kwargs["json"] = body
             ctx = getattr(session, method)(url, **kwargs)
@@ -299,7 +330,7 @@ class ChatGPTBackend:
                 resp = await ctx.__aenter__()
             except TimeoutError as exc:
                 raise ChatGPTBackendError("ChatGPT request timed out", "transient", timeout=True) from exc
-            except _NET_ERRORS as exc:
+            except (aiohttp.ClientError, OSError) as exc:
                 raise ChatGPTBackendError(f"ChatGPT connection failed ({type(exc).__name__})", "transient") from None
             if resp.status < 300:
                 return ctx, resp
@@ -339,73 +370,39 @@ class ChatGPTBackend:
                     self._manager_set_cooldown(exc.error_code)
                 raise
             rid = _safe(resp.headers.get("x-request-id"))
-            saw_text = False
+            streamed = ""
             terminal: dict[str, Any] | None = None
-            try:
-                async for ev in _iter_sse(resp.content):
-                    etype = str(ev.get("type", ""))
-                    if etype == "response.output_text.delta":
-                        delta = ev.get("delta")
-                        if isinstance(delta, str) and delta:
-                            saw_text = True
-                            yield {"type": "text", "text": delta}
-                    elif etype == "response.reasoning_summary_text.delta":
-                        delta = ev.get("delta")
-                        if isinstance(delta, str) and delta:
-                            yield {"type": "thinking", "text": delta}
-                    elif etype in ("response.completed", "response.failed", "response.incomplete", "error"):
-                        terminal = ev
-                        break
-            except _NET_ERRORS as exc:
-                raise ChatGPTBackendError(
-                    f"ChatGPT stream interrupted ({type(exc).__name__})",
-                    "transient",
-                    timeout=isinstance(exc, asyncio.TimeoutError),
-                    request_id=rid,
-                ) from None
+            async for ev in self._read_stream(resp, rid):
+                if ev["type"] == "text":
+                    streamed += ev["text"]
+                    yield ev
+                elif ev["type"] == "thinking":
+                    yield ev
+                elif ev["type"] == _REFUSAL_MARKER:
+                    self._manager_note_success(quota_epoch)  # the request completed, the model declined it
+                    raise _declined(rid)
+                else:
+                    terminal = ev
             if terminal is None:
                 raise ChatGPTBackendError("ChatGPT stream ended without a terminal event", "transient", request_id=rid)
             etype = str(terminal.get("type"))
             _LOGGER.debug("ChatGPT stream ended: terminal=%s status=%s request_id=%s", etype, resp.status, rid)
             response = terminal.get("response") if isinstance(terminal.get("response"), dict) else {}
             if etype != "response.completed":
-                err = terminal.get("error") or response.get("error") or None
-                code = _error_code({"error": err}) if isinstance(err, dict) else _error_code(terminal)
-                if etype == "response.incomplete":
-                    details = response.get("incomplete_details")
-                    reason = _safe(details.get("reason")) if isinstance(details, dict) else None
-                    _LOGGER.debug("ChatGPT stream failed: category=permanent code=%s", reason)
+                raise self._terminal_failure(terminal, response, rid)
+            self._manager_note_success(quota_epoch)  # only a success lifts the cooldown
+            final = _completed_text(response, rid)
+            if not streamed.strip():
+                if not final.strip():
                     raise ChatGPTBackendError(
-                        _describe(f"ChatGPT response incomplete reason={reason}", None, None, rid),
+                        "ChatGPT returned no text for this request",
                         "permanent",
-                        error_code=reason,
+                        no_retry=True,
+                        no_answer=True,
                         request_id=rid,
                     )
-                category = _classify_stream_error(code)
-                _LOGGER.debug("ChatGPT stream failed: category=%s code=%s", category, code)
-                what = _rate_limit_text() if category == "rate_limit" else f"ChatGPT stream {etype}"
-                exc = ChatGPTBackendError(
-                    _describe(what, None, code, rid),
-                    category,
-                    error_code=code,
-                    request_id=rid,
-                    no_retry=category in ("quota", "rate_limit"),
-                )
-                if category == "quota":
-                    self._manager_set_cooldown(code)
-                raise exc
-            self._manager_note_success(quota_epoch)  # only a success lifts the cooldown
+                yield {"type": "text", "text": final}
             usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
-            if not saw_text:
-                final = "".join(
-                    c.get("text", "")
-                    for item in response.get("output") or []
-                    if isinstance(item, dict)
-                    for c in item.get("content") or []
-                    if isinstance(c, dict) and c.get("type") == "output_text"
-                )
-                if final:
-                    yield {"type": "text", "text": final}
             yield {
                 "type": "stop",
                 "stop_reason": "end_turn",
@@ -417,6 +414,64 @@ class ChatGPTBackend:
         finally:
             if ctx is not None:
                 await ctx.__aexit__(None, None, None)
+
+    async def _read_stream(self, resp: Any, rid: str | None) -> AsyncIterator[dict[str, Any]]:
+        """Yield text and thinking events, then the terminal event (or a refusal marker) and stop."""
+        try:
+            async for ev in _iter_sse(resp.content):
+                etype = str(ev.get("type", ""))
+                delta = ev.get("delta")
+                if etype == "response.output_text.delta":
+                    if isinstance(delta, str) and delta:
+                        yield {"type": "text", "text": delta}
+                elif etype == "response.reasoning_summary_text.delta":
+                    if isinstance(delta, str) and delta:
+                        yield {"type": "thinking", "text": delta}
+                elif etype == "_malformed":
+                    raise ChatGPTBackendError("ChatGPT stream had an unreadable frame", "transient", request_id=rid)
+                elif etype.startswith("response.refusal."):
+                    yield {"type": _REFUSAL_MARKER}
+                    return
+                elif etype in ("response.completed", "response.failed", "response.incomplete", "error"):
+                    yield ev
+                    return
+        except (aiohttp.ClientError, OSError) as exc:
+            raise ChatGPTBackendError(
+                f"ChatGPT stream interrupted ({type(exc).__name__})",
+                "transient",
+                timeout=isinstance(exc, asyncio.TimeoutError),
+                request_id=rid,
+            ) from None
+
+    def _terminal_failure(
+        self, terminal: dict[str, Any], response: dict[str, Any], rid: str | None
+    ) -> ChatGPTBackendError:
+        """The error for a failed or incomplete terminal event; starts the cooldown on a quota failure."""
+        etype = str(terminal.get("type"))
+        err = terminal.get("error") or response.get("error") or None
+        code = _error_code({"error": err}) if isinstance(err, dict) else _error_code(terminal)
+        if etype == "response.incomplete":
+            details = response.get("incomplete_details")
+            reason = _safe(details.get("reason")) if isinstance(details, dict) else None
+            _LOGGER.debug("ChatGPT stream failed: category=permanent code=%s", reason)
+            return ChatGPTBackendError(
+                _describe(f"ChatGPT response incomplete reason={reason}", None, None, rid),
+                "permanent",
+                error_code=reason,
+                request_id=rid,
+            )
+        category = _classify_stream_error(code)
+        _LOGGER.debug("ChatGPT stream failed: category=%s code=%s", category, code)
+        what = _rate_limit_text() if category == "rate_limit" else f"ChatGPT stream {etype}"
+        if category == "quota":
+            self._manager_set_cooldown(code)
+        return ChatGPTBackendError(
+            _describe(what, None, code, rid),
+            category,
+            error_code=code,
+            request_id=rid,
+            no_retry=category in ("quota", "rate_limit"),
+        )
 
     async def async_stream(
         self,
@@ -464,7 +519,7 @@ class ChatGPTBackend:
             resolved_model=model,
         )
 
-    async def _fetch_models(self) -> list[str]:
+    async def async_fetch_models(self) -> list[str]:
         """GET /v1/models (never an inference request). Raises ChatGPTBackendError."""
         if self.client is None:
             raise ChatGPTBackendError("ChatGPT account is not connected", "auth", reauth_required=True, no_retry=True)
@@ -472,7 +527,7 @@ class ChatGPTBackend:
         try:
             try:
                 payload = json.loads(await resp.read())
-            except (ValueError, *_NET_ERRORS):
+            except ValueError, aiohttp.ClientError, OSError:
                 payload = None
         finally:
             await ctx.__aexit__(None, None, None)
@@ -484,7 +539,7 @@ class ChatGPTBackend:
     async def async_list_models(self) -> list[str]:
         """Visible model slugs; empty list on any failure (never raises)."""
         try:
-            return await self._fetch_models()
+            return await self.async_fetch_models()
         except Exception as exc:  # noqa: BLE001 - spec contract: must not raise
             _LOGGER.debug("ChatGPT model list unavailable: %s", exc)
             return []
@@ -494,7 +549,7 @@ class ChatGPTBackend:
         if hass is not None:
             self._hass = hass
         try:
-            models = await self._fetch_models()
+            models = await self.async_fetch_models()
         except ChatGPTBackendError as exc:
             if exc.category in ("transient", "quota", "rate_limit"):
                 return False, f"ChatGPT is not ready right now; try again later ({exc})"
@@ -538,6 +593,8 @@ async def _validate_credentials(config: dict[str, Any], hass: Any | None = None)
 CHATGPT_SPEC = ProviderSpec(
     id="chatgpt",
     label="ChatGPT subscription",
+    display_name="ChatGPT",
+    api_name="ChatGPT",
     credential_kind=CREDENTIAL_ACCOUNT,
     build_backend=ChatGPTBackend,
     usage_url=USAGE_URL,
@@ -549,6 +606,7 @@ CHATGPT_SPEC = ProviderSpec(
     list_models=_list_models,
     validate_credentials=_validate_credentials,
     settings_fields=(CONF_AI_CHATGPT_MODEL,),
+    credential_setting=None,
     model_setting=CONF_AI_CHATGPT_MODEL,
 )
 PROVIDERS.setdefault(CHATGPT_SPEC.id, CHATGPT_SPEC)

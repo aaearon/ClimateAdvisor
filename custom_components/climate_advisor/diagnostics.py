@@ -44,7 +44,7 @@ TO_REDACT = set(REDACTED_CONFIG_KEYS) | {key for key, meta in CONFIG_METADATA.it
 
 def _redaction_keys() -> set[str]:
     """``TO_REDACT`` plus each registered provider's own API-key setting (not in CONFIG_METADATA)."""
-    return TO_REDACT | {spec.credential_setting for spec in PROVIDERS.values()}
+    return TO_REDACT | {spec.credential_setting for spec in PROVIDERS.values() if spec.credential_setting}
 
 
 def _chart_data_summary(coordinator: Any) -> dict[str, Any]:

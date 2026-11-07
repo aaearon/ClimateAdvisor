@@ -35,7 +35,7 @@ import pytest  # noqa: E402
 
 from custom_components.climate_advisor import ai_account  # noqa: E402
 from custom_components.climate_advisor.ai_account import (  # noqa: E402
-    ACCOUNT_DATA_KEY,
+    AI_ACCOUNT_HASS_KEY,
     REVOCATION_CONFIRMED,
     REVOCATION_NOT_NEEDED,
     REVOCATION_UNCONFIRMED,
@@ -410,8 +410,8 @@ class TestPlacementAndStore:
 
     def test_lives_outside_domain_data(self, env):
         manager = asyncio.run(async_get_account_manager(env.hass))
-        assert ACCOUNT_DATA_KEY == "climate_advisor_ai_account"
-        assert env.hass.data[ACCOUNT_DATA_KEY] is manager
+        assert AI_ACCOUNT_HASS_KEY == "climate_advisor_ai_account"
+        assert env.hass.data[AI_ACCOUNT_HASS_KEY] is manager
         assert DOMAIN not in env.hass.data
 
     def test_get_or_create_returns_one_instance_and_loads_once(self, env):
@@ -937,17 +937,46 @@ class TestRotationPersistedBeforeRelease:
         assert env.disk.data["credentials"]["refresh_token"] == "rt_NEWREFRESH00001"
 
 
+class TestAccountIdentity:
+    def test_none_until_signed_in_then_owner_and_subject_through_rotation(self, env):
+        async def run():
+            manager = await async_get_account_manager(env.hass)
+            assert manager.account_identity is None
+            await env.login(manager)
+            identity = manager.account_identity
+            assert identity[0] == OWNER and identity[1]
+            env.clock(2 * HOUR)
+            env.session.token_responses = [_token_ok()]
+            await manager.async_get_access_token()
+            assert manager.account_identity == identity
+            await manager.async_disconnect()
+            assert manager.account_identity is None
+
+        asyncio.run(run())
+
+
 class TestHostId:
-    def test_created_before_any_connect_and_persisted(self, env):
+    def test_loading_creates_nothing(self, env):
         manager = asyncio.run(async_get_account_manager(env.hass))
+        assert manager.host_id is None
+        assert env.disk.data is None
+
+    def test_created_and_persisted_when_sign_in_begins(self, env):
+        async def run():
+            manager = await async_get_account_manager(env.hass)
+            url = await manager.async_begin_login()
+            return manager, url
+
+        manager, url = asyncio.run(run())
         assert manager.host_id.startswith("urn:uuid:")
         assert env.disk.data["host_id"] == manager.host_id
+        assert _query(url)["ext_agent_host_id"] == manager.host_id
 
     def test_stable_across_restart_connect_rotation_and_disconnect(self, env):
         async def run():
             manager = await async_get_account_manager(env.hass)
-            host = manager.host_id
             url = await manager.async_begin_login()
+            host = manager.host_id
             assert _query(url)["ext_agent_host_id"] == host
             env.session.token_responses = [_exchange_ok(ext_agent_host_id="urn:uuid:other")]
             await manager.async_complete_login(_callback(url, ext_agent_host_id="urn:uuid:other"), OWNER)
@@ -1427,7 +1456,7 @@ class TestUnloadVersusRemoval:
         assert asyncio.run(run()) == REVOCATION_CONFIRMED
         assert env.disk.events == ["revoke_post", "remove"]
         assert env.disk.data is None
-        assert ACCOUNT_DATA_KEY not in env.hass.data
+        assert AI_ACCOUNT_HASS_KEY not in env.hass.data
         assert env.timers.active == []
         assert env.session.revokes() == [{"token": REFRESH, "token_type_hint": "refresh_token", "client_id": CLIENT_ID}]
         env.issues.async_delete_issue.assert_called()
@@ -3036,18 +3065,19 @@ class TestRemovalThatCannotDelete:
             env.disk.remove_raises = True
             assert await _soon(async_remove_account(env.hass)) == REVOCATION_UNCONFIRMED
             assert env.disk.data == {}
-            assert ACCOUNT_DATA_KEY not in env.hass.data
+            assert AI_ACCOUNT_HASS_KEY not in env.hass.data
 
             env.restart()
             new = await _soon(async_get_account_manager(env.hass))
             assert new is not manager
             assert new.status()["state"] == STATE_DISCONNECTED
             assert new.owner_user_id is None
-            # Same as a removal that deleted: a new host ID, saved and then stable.
-            assert new.host_id and new.host_id != old_host
-            assert env.disk.data["host_id"] == new.host_id
+            # Same as a removal that deleted: a new host ID on the next sign-in, saved and then stable.
+            assert new.host_id is None
             url = await _soon(new.async_begin_login())
             assert _query(url)["client_id"] == ai_account._BOOTSTRAP_CLIENT_ID
+            assert new.host_id and new.host_id != old_host
+            assert env.disk.data["host_id"] == new.host_id
             env.restart()
             assert (await _soon(async_get_account_manager(env.hass))).host_id == new.host_id
 
@@ -3062,7 +3092,7 @@ class TestRemovalThatCannotDelete:
             env.disk.remove_raises = True
             setattr(env.disk, failure, True)
             assert await _soon(async_remove_account(env.hass)) == REVOCATION_CONFIRMED
-            assert ACCOUNT_DATA_KEY not in env.hass.data
+            assert AI_ACCOUNT_HASS_KEY not in env.hass.data
             assert manager._closed is True
             assert [form["token"] for form in env.session.revokes()] == [REFRESH]
 

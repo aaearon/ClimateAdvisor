@@ -115,6 +115,8 @@ class FakeManager:
         self.successes = 0
         self.cooldown_checks = 0
         self.fail_refresh: Exception | None = None
+        self.account_identity: Any = ("owner", "subject")
+        self.quota_epoch = 0
 
     async def async_get_access_token(self, force_refresh: bool = False) -> str:
         if getattr(self, "fail_token", None):
@@ -135,6 +137,15 @@ class FakeManager:
 
     def set_quota_cooldown(self, code) -> None:
         self.cooldown_set.append(code)
+
+
+class FakeClientError(Exception):
+    """Stands in for aiohttp.ClientError, a MagicMock in the stubbed environment."""
+
+
+@pytest.fixture(autouse=True)
+def _real_client_error(monkeypatch):
+    monkeypatch.setattr(cb.aiohttp, "ClientError", FakeClientError)
 
 
 @pytest.fixture(autouse=True)
@@ -365,6 +376,7 @@ class TestManagerIntegration:
         mgr = ChatGPTAccountManager.__new__(ChatGPTAccountManager)
         mgr._quota_until = 1.0  # cooldown already elapsed
         mgr._quota_probe_until = None
+        mgr._quota_epoch = 0
         mgr._schedule_save = lambda: None
 
         async def tok(force_refresh=False):
@@ -754,3 +766,232 @@ class TestSpec:
     def test_inactive_reason(self):
         assert cb.ChatGPTBackend({}, None).inactive_reason
         assert cb.ChatGPTBackend({}, FakeManager()).inactive_reason is None
+
+
+class TestMalformedFrames:
+    def test_unparseable_frame_fails_the_stream(self):
+        lines = [*sse(delta("partial")), b"data: {not json\n", b"\n", *sse(delta("rest"), completed())]
+        backend, mgr, session = make(FakeResp(lines=lines))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "transient")
+        assert mgr.successes == 0
+
+    def test_non_object_frame_fails_the_stream(self):
+        backend, _, session = make(FakeResp(lines=[b"data: 42\n", b"\n", *sse(delta("x"), completed())]))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "transient")
+
+    def test_request_path_fails_too(self):
+        backend, _, session = make(FakeResp(lines=[b"data: {not json\n", b"\n", *sse(delta("x"), completed())]))
+        with pytest.raises(AIBackendError):
+            run_request(backend, session)
+
+    def test_comments_keepalives_and_done_marker_are_ignored(self):
+        lines = [
+            b": keepalive\n",
+            b"\n",
+            b"event: ping\n",
+            b"\n",
+            b"data:\n",
+            b"\n",
+            b'event: ping\ndata: {"type": "ping"}\n',
+            b"\n",
+            *sse(delta("x"), completed()),
+            b"data: [DONE]\n",
+            b"\n",
+        ]
+        backend, _, session = make(FakeResp(lines=lines))
+        events, exc = run_stream(backend, session)
+        assert exc is None and [e["type"] for e in events] == ["text", "stop"]
+
+
+class TestNoAnswer:
+    def test_refusal_delta_is_an_error_and_is_not_echoed(self):
+        refusal = {"type": "response.refusal.delta", "delta": "I can't help with SECRET-REFUSAL"}
+        backend, _, session = make(FakeResp(lines=sse(refusal, completed())))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "permanent")
+        assert exc.no_retry and exc.no_answer
+        assert "declined" in str(exc) and "SECRET-REFUSAL" not in str(exc)
+
+    def test_refusal_only_in_the_completed_output_is_an_error(self):
+        done = {
+            "type": "response.completed",
+            "response": {"output": [{"content": [{"type": "refusal", "refusal": "no"}]}]},
+        }
+        backend, _, session = make(FakeResp(lines=sse(done)))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "permanent")
+        assert exc.no_answer and "declined" in str(exc)
+
+    def test_completed_with_no_text_at_all_is_an_error(self):
+        backend, _, session = make(FakeResp(lines=sse(completed())))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "permanent")
+        assert exc.no_retry and exc.no_answer
+
+    def test_whitespace_only_delta_is_an_error(self):
+        backend, _, session = make(FakeResp(lines=sse(delta("  \n"), completed())))
+        events, exc = run_stream(backend, session)
+        assert exc is not None and exc.category == "permanent"
+        assert exc.no_retry and exc.no_answer
+        assert all(e["type"] != "stop" for e in events)
+
+    def test_whitespace_only_delta_is_an_error_when_aggregated(self):
+        backend, _, session = make(FakeResp(lines=sse(delta(" "), completed())))
+        with pytest.raises(AIBackendError) as info:
+            run_request(backend, session)
+        assert info.value.no_answer
+
+    def test_text_then_refusal_in_the_completed_output_is_an_error(self):
+        done = {
+            "type": "response.completed",
+            "response": {"output": [{"content": [{"type": "refusal", "refusal": "no"}]}]},
+        }
+        backend, _, session = make(FakeResp(lines=sse(delta("partial"), done)))
+        events, exc = run_stream(backend, session)
+        assert exc is not None and exc.no_answer and "declined" in str(exc)
+        assert all(e["type"] != "stop" for e in events)
+        backend, _, session = make(FakeResp(lines=sse(delta("partial"), done)))
+        with pytest.raises(AIBackendError) as info:
+            run_request(backend, session)
+        assert info.value.no_answer
+
+    def test_short_answers_are_kept(self):
+        backend, _, session = make(FakeResp(lines=sse(delta("4"), completed())))
+        events, exc = run_stream(backend, session)
+        assert exc is None and [e["type"] for e in events] == ["text", "stop"]
+
+    def test_whitespace_delta_with_text_in_the_completed_output_uses_that_text(self):
+        done = {
+            "type": "response.completed",
+            "response": {"output": [{"content": [{"type": "output_text", "text": "Yes"}]}]},
+        }
+        backend, _, session = make(FakeResp(lines=sse(delta(" "), done)))
+        assert run_request(backend, session).content.strip() == "Yes"
+
+    @pytest.mark.parametrize("kind", ["delta_refusal", "output_refusal", "empty"])
+    def test_every_no_answer_outcome_notes_the_request_as_succeeded(self, kind):
+        refusal_item = {"type": "response.completed", "response": {"output": [{"content": [{"type": "refusal"}]}]}}
+        lines = {
+            "delta_refusal": sse({"type": "response.refusal.delta", "delta": "x"}, completed()),
+            "output_refusal": sse(refusal_item),
+            "empty": sse(completed()),
+        }[kind]
+        backend, mgr, session = make(FakeResp(lines=lines))
+        _, exc = run_stream(backend, session)
+        assert exc is not None and exc.no_answer
+        assert mgr.successes == 1
+
+    def test_client_reports_it_without_retrying_or_counting_the_breaker(self):
+        from custom_components.climate_advisor.claude_api import ClaudeAPIClient
+
+        mgr = FakeManager()
+        client = ClaudeAPIClient({"ai_enabled": True, "ai_provider": "chatgpt", "ai_chatgpt_model": "m"}, mgr)
+        session = FakeSession(FakeResp(lines=sse(completed())), FakeResp(lines=sse(completed())))
+        with patch.object(cb, "_get_session", return_value=session):
+            response = asyncio.run(client.async_request("S", "U"))
+        assert not response.success and response.no_answer and response.error
+        assert len(session.calls) == 1
+        assert client._circuit_breaker.consecutive_failures == 0
+
+    def test_client_logs_name_the_provider_not_claude(self, caplog):
+        from custom_components.climate_advisor.claude_api import ClaudeAPIClient
+
+        client = ClaudeAPIClient({"ai_enabled": True, "ai_provider": "chatgpt", "ai_chatgpt_model": "m"}, FakeManager())
+        session = FakeSession(FakeResp(lines=sse(completed())))
+        with caplog.at_level(logging.WARNING), patch.object(cb, "_get_session", return_value=session):
+            asyncio.run(client.async_request("S", "U"))
+        assert "ChatGPT request not retried" in caplog.text
+        assert "Claude API" not in caplog.text
+
+
+class _SwappingSession(FakeSession):
+    """After the first send, the shared account changes hands."""
+
+    def __init__(self, mgr: FakeManager, *responses: FakeResp) -> None:
+        super().__init__(*responses)
+        self.mgr = mgr
+
+    def _do(self, method, url, **kw):
+        result = super()._do(method, url, **kw)
+        self.mgr.account_identity = ("new-owner", "new-subject")
+        return result
+
+
+class TestRequestBoundToItsAccount:
+    def _bound(self, *responses: FakeResp):
+        mgr = FakeManager()
+        mgr.account_identity = ("owner-1", "subject-1")
+        backend = cb.ChatGPTBackend({}, mgr, hass=object()).for_request()
+        return backend, mgr, _SwappingSession(mgr, *responses)
+
+    def test_503_backoff_does_not_resend_after_the_account_changed(self):
+        backend, _mgr, session = self._bound(FakeResp(503), FakeResp(lines=sse(delta("x"), completed())))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "auth")
+        assert exc.no_retry and len(session.calls) == 1
+
+    def test_401_does_not_refresh_or_resend_after_the_account_changed(self):
+        backend, mgr, session = self._bound(FakeResp(401), FakeResp(lines=sse(delta("x"), completed())))
+        events, exc = run_stream(backend, session)
+        assert_failed_before_stop(events, exc, "auth")
+        assert mgr.refreshes == 0 and len(session.calls) == 1
+
+    def test_account_changing_during_the_token_read_sends_nothing(self):
+        backend, mgr, session = self._bound(FakeResp(lines=sse(delta("x"), completed())))
+        real = mgr.async_get_access_token
+
+        async def swap(force_refresh: bool = False) -> str:
+            mgr.account_identity = ("new-owner", "new-subject")
+            return await real(force_refresh)
+
+        mgr.async_get_access_token = swap
+        _events, exc = run_stream(backend, session)
+        assert exc is not None and session.calls == []
+
+    def test_same_account_after_a_token_refresh_is_still_served(self):
+        mgr = FakeManager()
+        mgr.account_identity = ("owner-1", "subject-1")
+        backend = cb.ChatGPTBackend({}, mgr, hass=object()).for_request()
+        session = FakeSession(FakeResp(401), FakeResp(lines=sse(delta("x"), completed())))
+        events, exc = run_stream(backend, session)
+        assert exc is None and events[-1]["type"] == "stop"
+        assert session.calls[1]["headers"]["Authorization"] == f"Bearer {TOKEN2}"
+
+    def test_unbound_backend_is_unaffected_by_a_change(self):
+        """The model list and readiness probe are not a user's request."""
+        mgr = FakeManager()
+        mgr.account_identity = ("owner-1", "subject-1")
+        backend = cb.ChatGPTBackend({}, mgr, hass=object())
+        session = _SwappingSession(mgr, FakeResp(503), FakeResp(lines=sse(delta("x"), completed())))
+        _events, exc = run_stream(backend, session)
+        assert exc is None
+
+    def test_client_retry_does_not_reach_a_newly_connected_account(self):
+        from custom_components.climate_advisor.claude_api import ClaudeAPIClient
+
+        mgr = FakeManager()
+        mgr.account_identity = ("owner-1", "subject-1")
+        client = ClaudeAPIClient({"ai_enabled": True, "ai_provider": "chatgpt", "ai_chatgpt_model": "m"}, mgr)
+        session = _SwappingSession(mgr, FakeResp(500), FakeResp(lines=sse(delta("x"), completed())))
+        with patch.object(cb, "_get_session", return_value=session):
+            response = asyncio.run(client.async_request("S", "U"))
+        assert not response.success and response.no_retry
+        assert len(session.calls) == 1
+        assert client._circuit_breaker.consecutive_failures == 0
+
+    def test_client_stream_binds_too(self):
+        from custom_components.climate_advisor.claude_api import ClaudeAPIClient
+
+        mgr = FakeManager()
+        mgr.account_identity = ("owner-1", "subject-1")
+        client = ClaudeAPIClient({"ai_enabled": True, "ai_provider": "chatgpt", "ai_chatgpt_model": "m"}, mgr)
+        session = _SwappingSession(mgr, FakeResp(503), FakeResp(lines=sse(delta("x"), completed())))
+
+        async def go():
+            return [e async for e in client.async_request_streaming("S", "U")]
+
+        with patch.object(cb, "_get_session", return_value=session), pytest.raises(AIBackendError):
+            asyncio.run(go())
+        assert len(session.calls) == 1

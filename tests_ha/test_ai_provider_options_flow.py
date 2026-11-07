@@ -119,7 +119,7 @@ async def test_provider_switch_round_trip(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chatgpt_save_leads_to_account_menu_and_privacy_form(hass: HomeAssistant) -> None:
+async def test_chatgpt_save_leads_to_account_menu_and_signin_form(hass: HomeAssistant) -> None:
     seed = next(e for e in json.loads(_SEED.read_text("utf-8"))["data"]["entries"] if e["domain"] == DOMAIN)
     entry = MockConfigEntry(domain=DOMAIN, version=seed["version"], data={**seed["data"], "ai_provider": "chatgpt"})
     entry.add_to_hass(hass)
@@ -127,13 +127,15 @@ async def test_chatgpt_save_leads_to_account_menu_and_privacy_form(hass: HomeAss
     form = await _open_ai_step(hass, entry, "chatgpt")
     menu = await hass.config_entries.options.async_configure(form["flow_id"], {"ai_enabled": True})
     assert menu["type"] is FlowResultType.MENU and menu["step_id"] == "ai_account"
-    assert "ai_account_privacy" in menu["menu_options"]
+    assert "ai_account_signin" in menu["menu_options"]
 
-    privacy = await hass.config_entries.options.async_configure(menu["flow_id"], {"next_step_id": "ai_account_privacy"})
-    assert privacy["type"] is FlowResultType.FORM and _fields(privacy) == {"ai_account_consent"}
-    refused = await hass.config_entries.options.async_configure(privacy["flow_id"], {"ai_account_consent": False})
-    assert refused["errors"] == {"base": "consent_required"}
-    hass.config_entries.options.async_abort(refused["flow_id"])
+    with patch.object(config_flow, "_current_user_id", return_value=None):
+        signin = await hass.config_entries.options.async_configure(
+            menu["flow_id"], {"next_step_id": "ai_account_signin"}
+        )
+    assert signin["type"] is FlowResultType.FORM and _fields(signin) == {"ai_account_redirect_url"}
+    assert signin["errors"] == {"base": "owner_required"}
+    hass.config_entries.options.async_abort(signin["flow_id"])
 
 
 @pytest.mark.asyncio
@@ -171,6 +173,8 @@ def own_key_provider():
         get_provider("anthropic"),
         id="ownkey",
         label="Own Key Router",
+        display_name="Own Key Router",
+        api_name="Own Key Router",
         build_backend=lambda config, client=None: MagicMock(client=object(), inactive_reason=None),
         supports_tuning=False,
         supports_tier_fallback=False,
@@ -194,7 +198,7 @@ async def test_own_key_provider_form_validation_and_saving(hass: HomeAssistant, 
     form = await _open_ai_step(hass, entry, "ownkey")
     assert "ai_ownkey_key" in _fields(form) and "ai_api_key" not in _fields(form)
     # Claude's saved key is not this provider's key: not masked as configured, and not accepted.
-    assert "••••" not in form["description_placeholders"]["key_status"]
+    assert "••••" not in form["description_placeholders"]["status_lines"]
     base = {"ai_enabled": True, "ai_ownkey_model": "own/m1"}
     missing = await hass.config_entries.options.async_configure(form["flow_id"], base)
     assert missing["errors"] == {"ai_ownkey_key": "ai_key_required"}
@@ -215,7 +219,7 @@ async def test_own_key_provider_form_validation_and_saving(hass: HomeAssistant, 
     # Blank on the next visit keeps the saved key, without re-validating it.
     own_key_provider.reset_mock()
     again = await _open_ai_step(hass, entry, "ownkey")
-    assert again["description_placeholders"]["key_status"].endswith("1234")
+    assert again["description_placeholders"]["status_lines"].endswith("1234")
     await hass.config_entries.options.async_configure(again["flow_id"], base)
     assert entry.data["ai_ownkey_key"] == "good-key-1234"
     own_key_provider.assert_not_awaited()
@@ -309,8 +313,7 @@ async def _sign_in_from_menu(hass: HomeAssistant, entry: MockConfigEntry):
     form = await _open_ai_step(hass, entry, "chatgpt")
     step = await hass.config_entries.options.async_configure(form["flow_id"], {"ai_enabled": True})
     assert step["step_id"] == "ai_account"
-    step = await hass.config_entries.options.async_configure(step["flow_id"], {"next_step_id": "ai_account_privacy"})
-    step = await hass.config_entries.options.async_configure(step["flow_id"], {"ai_account_consent": True})
+    step = await hass.config_entries.options.async_configure(step["flow_id"], {"next_step_id": "ai_account_signin"})
     assert step["step_id"] == "ai_account_signin"
     return await hass.config_entries.options.async_configure(
         step["flow_id"], {"ai_account_redirect_url": "http://127.0.0.1:1455/auth/callback?code=c&state=fake"}
@@ -431,10 +434,7 @@ async def test_done_says_ai_is_off_when_the_zone_has_ai_turned_off(
         step = await hass.config_entries.options.async_configure(
             form["flow_id"], {"ai_enabled": False, "ai_chatgpt_model": "gpt-x"}
         )
-        step = await hass.config_entries.options.async_configure(
-            step["flow_id"], {"next_step_id": "ai_account_privacy"}
-        )
-        step = await hass.config_entries.options.async_configure(step["flow_id"], {"ai_account_consent": True})
+        step = await hass.config_entries.options.async_configure(step["flow_id"], {"next_step_id": "ai_account_signin"})
         done = await hass.config_entries.options.async_configure(
             step["flow_id"], {"ai_account_redirect_url": "http://127.0.0.1:1455/auth/callback?code=c&state=fake"}
         )
@@ -606,3 +606,54 @@ async def test_investigator_note_placeholder_only_for_claude(hass: HomeAssistant
     assert desc.format(investigator_note=note) == (
         "Maximum investigative analysis runs per day. Each investigation uses extended thinking. Resets at midnight."
     )
+
+
+# ---------------------------------------------------------------------------
+# AI failures never fail setup; Claude-only installs get no account store
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ai_enabled", [False, True], ids=["ai_off", "ai_on"])
+async def test_provider_registration_failure_never_fails_setup(hass: HomeAssistant, tmp_path, ai_enabled) -> None:
+    hass.config.config_dir = str(tmp_path)
+    with (
+        patch("custom_components.climate_advisor.ai_providers.ensure_providers_registered", side_effect=TypeError("x")),
+        patch(
+            "custom_components.climate_advisor.async_ensure_providers_registered", AsyncMock(side_effect=TypeError("x"))
+        ),
+    ):
+        entry = await _setup_zone(hass, ai_enabled=ai_enabled, ai_api_key="sk-ant-keepme")
+    assert hass.data[DOMAIN][entry.entry_id].claude_client is None
+
+
+@pytest.mark.asyncio
+async def test_claude_only_install_creates_no_account_store(hass: HomeAssistant, hass_storage, tmp_path) -> None:
+    hass.config.config_dir = str(tmp_path)
+    await _setup_zone(hass, ai_api_key="sk-ant-keepme")
+    assert "climate_advisor.ai_account" not in hass_storage
+    assert hass.data[AI_ACCOUNT_HASS_KEY].host_id is None
+
+
+@pytest.mark.asyncio
+async def test_existing_sign_in_loads_unchanged(hass: HomeAssistant, hass_storage, tmp_path) -> None:
+    hass.config.config_dir = str(tmp_path)
+    stored = {
+        "host_id": "urn:uuid:existing",
+        "state": "connected",
+        "owner_user_id": "owner-1",
+        "credentials": {
+            "client_id": "c",
+            "subject": "s",
+            "access_token": "a",
+            "refresh_token": "r",
+            "expires_at": 9e12,
+        },
+    }
+    hass_storage["climate_advisor.ai_account"] = {"version": 1, "minor_version": 1, "key": "x", "data": stored}
+    await _setup_zone(hass, ai_provider="chatgpt", ai_chatgpt_model="gpt-x")
+    manager = hass.data[AI_ACCOUNT_HASS_KEY]
+    assert manager.state == "connected" and manager.owner_user_id == "owner-1"
+    assert manager.host_id == "urn:uuid:existing"
+    assert hass_storage["climate_advisor.ai_account"]["data"] == stored
+    manager.async_cancel_runtime_tasks()

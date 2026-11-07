@@ -439,7 +439,7 @@
       },
       "ai_settings": {
         "title": "AI Settings",
-        "description": "Configure AI for intelligent analysis and reporting.\nProvider: {provider_label}\nAPI Key Status: {key_status}\n{account_hint}",
+        "description": "Configure {display_name} integration for intelligent analysis and reporting.\n{status_lines}",
         "data": {
           "ai_enabled": "Enable AI Features",
           "ai_api_key": "Claude API Key",
@@ -485,24 +485,14 @@
         "title": "ChatGPT Account",
         "description": "{account_summary}\n\nThe ChatGPT account is shared by every zone. Signing in here covers all zones, so you only do it once, from any zone's AI Settings.",
         "menu_options": {
-          "ai_account_privacy": "Sign in with ChatGPT",
+          "ai_account_signin": "Sign in with ChatGPT",
           "ai_account_disconnect": "Disconnect ChatGPT",
           "init": "Back to the options menu"
         }
       },
-      "ai_account_privacy": {
-        "title": "Sign in with ChatGPT",
-        "description": "Climate Advisor will use your ChatGPT plan, not an API key, for AI features.\n\n**What is sent, and to whom:** running an investigation sends your home's recent event log, settings summary and sensor history to OpenAI, using your ChatGPT plan, and the usage counts against that plan. Requests ask OpenAI not to store them. Only the Home Assistant user who signs in here can start an investigation, and only by clicking Investigate. You can disconnect at any time.\n\n**Backups:** the saved sign-in is included in Home Assistant backups. Treat backups as sensitive; restoring an old one will ask you to sign in again.\n\nThe account is shared by every zone. Once you sign in from this zone, the other zones use it too.",
-        "data": {
-          "ai_account_consent": "Yes, sign in with ChatGPT"
-        },
-        "data_description": {
-          "ai_account_consent": "Turn on to agree to the above and continue to the ChatGPT sign-in page."
-        }
-      },
       "ai_account_signin": {
         "title": "Sign in with ChatGPT",
-        "description": "1. Open the [Sign in with ChatGPT]({login_url}) link and sign in. Use the same browser you are using now.\n2. When you finish, the browser opens a page at an address starting with `{redirect_host}`. That page will fail to load. This is expected: nothing is wrong.\n3. Copy the full address from the browser's address bar and paste it below.\n\nThe account is shared by every zone, so this signs in all of them.",
+        "description": "1. Open the [Sign in with ChatGPT]({login_url}) link and sign in. Use the same browser you are using now.\n2. When you finish, the browser opens a page at an address starting with `{redirect_host}`. That page will fail to load. This is expected: nothing is wrong.\n3. Copy the full address from the browser's address bar and paste it below.\n\nThe account is shared by every zone, so this signs in all of them. Requests send this home's climate data to OpenAI under the connected ChatGPT plan.",
         "data": {
           "ai_account_redirect_url": "Address of the failed page"
         },
@@ -548,7 +538,7 @@
       "schedule_start_end_equal": "Start and end time must be different",
       "preheat_min_exceeds_max": "Minimum pre-heat time must not exceed maximum pre-heat time",
       "preheat_default_exceeds_max": "Default pre-heat time must not exceed maximum pre-heat time",
-      "ai_connection_failed": "Could not connect to the AI provider. Check your credentials and try again.",
+      "ai_connection_failed": "Could not connect to {api_name}. Check your API key and try again.",
       "ai_key_required": "API key is required when AI features are enabled.",
       "ai_temperature_out_of_range": "Temperature must be between 0.0 and 1.0.",
       "ai_max_tokens_out_of_range": "Max tokens value is out of the allowed range for this field.",
@@ -568,7 +558,6 @@
       "vacation_heat_above_away_warning": "Vacation heating is warmer than away heating, so a vacation uses more energy than a normal day out. Submit again to keep this.",
       "vacation_cool_below_away_warning": "Vacation cooling is cooler than away cooling, so a vacation uses more energy than a normal day out. Submit again to keep this.",
       "vacation_freeze_warning": "With this setting, vacation heating ends up below 45 °F (7 °C). Pipes can freeze during a long trip. Submit again to keep this.",
-      "consent_required": "Turn on the switch to continue, or go back.",
       "already_connected": "A ChatGPT account is already connected. Disconnect it first.",
       "owner_required": "Climate Advisor could not tell which Home Assistant user you are. Open this from the Home Assistant web interface as an administrator.",
       "no_pending_login": "There is no sign-in in progress. Use the new link above and try again.",

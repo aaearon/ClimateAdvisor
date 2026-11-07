@@ -41,6 +41,8 @@ class Account:
         self.hass = None
         self.cooldowns: list = []
         self.successes = 0
+        self.account_identity = ("owner", "subject")
+        self.quota_epoch = 0
 
     async def async_get_access_token(self, force_refresh: bool = False) -> str:
         return TOKEN
@@ -122,7 +124,7 @@ class TestRealStream:
         assert TOKEN not in caplog.text
 
     async def test_request_shape_and_authorization(self, served):
-        served.handler = _stream_handler(_sse(COMPLETED))
+        served.handler = _stream_handler(_sse({"type": "response.output_text.delta", "delta": "x"}, COMPLETED))
         backend, _ = _backend()
         await _collect(backend, [])
         (request,) = served.requests
@@ -236,3 +238,46 @@ class TestRealConnectionRefused:
         assert exc.value.category == "transient"
         assert TOKEN not in str(exc.value)
         assert TOKEN not in caplog.text
+
+
+class TestRedirectsAreRefused:
+    @pytest.fixture
+    async def redirecting(self, monkeypatch, socket_enabled):
+        """Both API routes answer with a redirect to a route that records whatever reaches it."""
+        reached: list[bytes] = []
+
+        async def target(request: web.Request) -> web.Response:
+            reached.append(await request.read())
+            return web.json_response({"models": []})
+
+        async def redirect(request: web.Request) -> web.Response:
+            return web.Response(status=request.app["redirect_status"], headers={"Location": "/elsewhere"})
+
+        app = web.Application()
+        app["redirect_status"] = 307
+        app.router.add_post("/v1/responses", redirect)
+        app.router.add_get("/v1/models", redirect)
+        app.router.add_route("*", "/elsewhere", target)
+        server = TestServer(app)
+        await server.start_server()
+        session = aiohttp.ClientSession()
+        monkeypatch.setattr(chatgpt_backend, "RESPONSES_URL", str(server.make_url("/v1/responses")))
+        monkeypatch.setattr(chatgpt_backend, "MODELS_URL", str(server.make_url("/v1/models")))
+        monkeypatch.setattr(chatgpt_backend, "_get_session", lambda _hass: session)
+        yield reached
+        await session.close()
+        await server.close()
+
+    async def test_inference_redirect_sends_nothing_to_the_target(self, redirecting):
+        backend, _ = _backend()
+        with pytest.raises(ChatGPTBackendError) as err:
+            await _collect(backend, [])
+        assert err.value.status == 307
+        assert redirecting == []
+
+    async def test_model_list_redirect_sends_nothing_to_the_target(self, redirecting):
+        backend, _ = _backend()
+        with pytest.raises(ChatGPTBackendError) as err:
+            await backend.async_fetch_models()
+        assert err.value.status == 307
+        assert redirecting == []

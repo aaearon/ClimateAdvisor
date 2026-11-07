@@ -77,6 +77,7 @@ def env(monkeypatch):
 
     def make(data=CHATGPT, manager=None):
         flow, captured = _make_options_flow(data)
+        flow._login_open = False  # the helper skips __init__
         manager = manager or FakeAccount()
         flow.hass.data = {AI_ACCOUNT_HASS_KEY: manager}
         flow.hass.async_create_task = MagicMock(side_effect=lambda coro: asyncio.ensure_future(coro))
@@ -106,13 +107,13 @@ class TestMenu:
         run(flow.async_step_ai_provider({"ai_provider": "chatgpt"}))
         result = run(flow.async_step_ai_settings({"ai_enabled": True}))
         assert result["step_id"] == "ai_account"
-        assert _menu_options(result) == ["ai_account_privacy", "init"]
+        assert _menu_options(result) == ["ai_account_signin", "init"]
         assert captured["data"]["ai_provider"] == "chatgpt"
 
     def test_unproved_save_does_not_say_nothing_is_connected(self, env):
         flow, _, _ = env(manager=FakeAccount(state="save_uncertain"))
         result = asyncio.run(flow.async_step_ai_account())
-        assert result["menu_options"] == ["ai_account_privacy", "init"]
+        assert result["menu_options"] == ["ai_account_signin", "init"]
         summary = result["description_placeholders"]["account_summary"]
         assert "could not be confirmed" in summary
         assert "No ChatGPT account" not in summary
@@ -120,7 +121,7 @@ class TestMenu:
     def test_reauth_required_offers_sign_in_again(self, env):
         flow, _, _ = env(manager=FakeAccount(state="reauth_required"))
         result = run(flow.async_step_ai_account())
-        assert _menu_options(result) == ["ai_account_privacy", "init"]
+        assert _menu_options(result) == ["ai_account_signin", "init"]
         assert "expired" in result["description_placeholders"]["account_summary"]
 
     def test_connected_shows_account_and_disconnect(self, env):
@@ -139,18 +140,19 @@ class TestMenu:
 
 
 class TestSignIn:
-    def test_privacy_step_needs_affirmative_choice(self, env):
+    def test_menu_goes_straight_to_the_link_with_no_gate(self, env):
         flow, _, manager = env()
-        form = run(flow.async_step_ai_account_privacy())
-        assert form["step_id"] == "ai_account_privacy"
-        assert "ai_account_consent" in {str(k) for k in form["data_schema"].schema}
-        again = run(flow.async_step_ai_account_privacy({"ai_account_consent": False}))
-        assert again["errors"] == {"base": "consent_required"}
-        assert manager.begins == 0
+        menu = run(flow.async_step_ai_account())
+        assert "ai_account_signin" in menu["menu_options"]
+        signin = run(flow.async_step_ai_account_signin())
+        assert signin["step_id"] == "ai_account_signin" and signin["errors"] == {}
+        assert signin["description_placeholders"]["login_url"] == f"{URL}1"
+        assert manager.begins == 1
+        assert not hasattr(flow, "async_step_ai_account_privacy")
 
     def test_full_flow_success_without_commit_or_reload(self, env):
         flow, captured, manager = env()
-        signin = run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        signin = run(flow.async_step_ai_account_signin())
         assert signin["step_id"] == "ai_account_signin"
         assert signin["description_placeholders"]["login_url"] == f"{URL}1"
         assert {str(k) for k in signin["data_schema"].schema} == {"ai_account_redirect_url"}
@@ -171,7 +173,7 @@ class TestSignIn:
     def test_temporary_readiness_error_does_not_fail_sign_in(self, env, monkeypatch):
         monkeypatch.setattr(config_flow, "_check_account_readiness", AsyncMock(return_value="not_ready"))
         flow, _, manager = env()
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         done = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
         assert done["step_id"] == "ai_account_done"
         assert manager.state == "connected"
@@ -179,7 +181,7 @@ class TestSignIn:
 
     def test_mistyped_paste_reshows_form_with_same_link(self, env):
         flow, _, manager = env()
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         manager.complete_errors = [_err("bad_url")]
         form = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": "oops"}))
         assert form["step_id"] == "ai_account_signin"
@@ -204,7 +206,7 @@ class TestSignIn:
     )
     def test_spent_login_gets_a_fresh_link(self, env, reason):
         flow, _, manager = env()
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         manager.complete_errors = [_err(reason)]
         form = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
         assert form["errors"] == {"ai_account_redirect_url": reason}
@@ -213,7 +215,7 @@ class TestSignIn:
     @pytest.mark.parametrize("reason", ["bad_url", "state_mismatch"])
     def test_attempt_kept_after_a_wrong_paste_keeps_the_same_link(self, env, reason):
         flow, _, manager = env()
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         manager.complete_errors = [_err(reason)]
         form = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
         assert form["description_placeholders"]["login_url"] == f"{URL}1"
@@ -222,7 +224,7 @@ class TestSignIn:
     @pytest.mark.parametrize("reason", config_flow.ACCOUNT_LOGIN_ERROR_REASONS)
     def test_every_reason_maps_to_an_existing_string(self, env, reason):
         flow, _, manager = env()
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         manager.complete_errors = [_err(reason)]
         form = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
         key = form["errors"]["ai_account_redirect_url"]
@@ -231,7 +233,7 @@ class TestSignIn:
 
     def test_unknown_reason_and_backend_error_show_generic_text(self, env):
         flow, _, manager = env()
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         novel = _err("save_failed")
         novel.reason = "brand_new"  # a reason the flow has no string for
         manager.complete_errors = [novel, AIBackendError("disk", "transient")]
@@ -240,21 +242,27 @@ class TestSignIn:
             assert form["errors"] == {"ai_account_redirect_url": "login_failed"}
         assert "login_failed" in STRINGS["options"]["error"]
 
-    def test_begin_failure_stays_on_privacy_step(self, env):
+    def test_begin_failure_shows_the_error_and_submitting_tries_again(self, env):
         flow, _, manager = env()
         manager.begin_error = _err("already_connected")
-        form = run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
-        assert form["step_id"] == "ai_account_privacy"
+        form = run(flow.async_step_ai_account_signin())
+        assert form["step_id"] == "ai_account_signin"
         assert form["errors"] == {"base": "already_connected"}
+        assert form["description_placeholders"]["login_url"] == ""
+        manager.begin_error = None
+        retried = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": ""}))
+        assert retried["errors"] == {} and retried["description_placeholders"]["login_url"] == f"{URL}1"
+        assert manager.completed_with == []
 
     def test_no_user_id_refuses_with_owner_required_and_never_guesses(self, env, monkeypatch):
         monkeypatch.setattr(config_flow, "_current_user_id", lambda: None)
         flow, _, manager = env()
-        form = run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        form = run(flow.async_step_ai_account_signin())
         assert form["errors"] == {"base": "owner_required"}
         assert manager.begins == 0
         manager.has_pending_login = True
         flow._login_url = URL
+        flow._login_open = True
         form = run(flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
         assert form["errors"] == {"ai_account_redirect_url": "owner_required"}
         assert manager.completed_with == []
@@ -262,7 +270,7 @@ class TestSignIn:
     def test_abandoned_flow_cancels_pending_login(self, env):
         async def go():
             flow, _, manager = env()
-            await flow.async_step_ai_account_privacy({"ai_account_consent": True})
+            await flow.async_step_ai_account_signin()
             flow.async_remove()
             await asyncio.sleep(0)
             return manager
@@ -273,7 +281,7 @@ class TestSignIn:
     def test_finished_flow_does_not_cancel(self, env):
         async def go():
             flow, _, manager = env()
-            await flow.async_step_ai_account_privacy({"ai_account_consent": True})
+            await flow.async_step_ai_account_signin()
             await flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED})
             flow.async_remove()
             await asyncio.sleep(0)
@@ -284,7 +292,7 @@ class TestSignIn:
 
 class TestReadinessProbe:
     def test_probes_the_registered_account_provider_not_a_hardcoded_id(self, monkeypatch):
-        backend = MagicMock(_fetch_models=AsyncMock())
+        backend = MagicMock(async_fetch_models=AsyncMock())
         build = MagicMock(return_value=backend)
         from custom_components.climate_advisor import ai_providers
 
@@ -298,12 +306,12 @@ class TestReadinessProbe:
         manager = object()
         assert run(_REAL_READINESS(MagicMock(), manager)) == "ready"
         build.assert_called_once_with({}, manager)
-        backend._fetch_models.assert_awaited_once()
+        backend.async_fetch_models.assert_awaited_once()
 
 
 class TestModelAfterSignIn:
     def _sign_in(self, flow):
-        run(flow.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(flow.async_step_ai_account_signin())
         return run(flow.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
 
     def test_no_model_goes_to_a_model_choice_without_committing_first(self, env):
@@ -371,8 +379,8 @@ class TestOverlappingFlows:
         manager = FakeAccount()
         first, _, _ = env(manager=manager)
         second, _, _ = env(manager=manager)
-        run(first.async_step_ai_account_privacy({"ai_account_consent": True}))
-        run(second.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(first.async_step_ai_account_signin())
+        run(second.async_step_ai_account_signin())
         assert (first._login_id, second._login_id) == ("id1", "id2")
         first.async_remove()
         manager.async_cancel_login.assert_called_once_with("id1")
@@ -382,7 +390,7 @@ class TestOverlappingFlows:
     def test_stale_paste_gets_state_mismatch_and_does_not_restart_the_login(self, env):
         manager = FakeAccount()
         first, _, _ = env(manager=manager)
-        run(first.async_step_ai_account_privacy({"ai_account_consent": True}))
+        run(first.async_step_ai_account_signin())
         manager.complete_errors = [_err("state_mismatch")]
         form = run(first.async_step_ai_account_signin({"ai_account_redirect_url": PASTED}))
         assert form["errors"] == {"ai_account_redirect_url": "state_mismatch"}
@@ -418,16 +426,14 @@ class TestStrings:
 
     def test_new_steps_have_strings_and_field_labels(self):
         for step in (
-            "ai_account_privacy",
             "ai_account_signin",
             "ai_account_model",
             "ai_account_done",
             "ai_account_disconnect",
         ):
             assert self.steps[step]["title"] and self.steps[step]["description"]
-        assert set(self.steps["ai_account"]["menu_options"]) == {"ai_account_privacy", "ai_account_disconnect", "init"}
+        assert set(self.steps["ai_account"]["menu_options"]) == {"ai_account_signin", "ai_account_disconnect", "init"}
         for step, key in (
-            ("ai_account_privacy", "ai_account_consent"),
             ("ai_account_signin", "ai_account_redirect_url"),
             ("ai_account_model", "ai_chatgpt_model"),
             ("ai_account_disconnect", "ai_account_consent"),
@@ -445,9 +451,10 @@ class TestStrings:
         assert "ai_provider" not in self.steps["ai_settings"]["data_description"]
 
     def test_required_texts(self):
-        privacy = self.steps["ai_account_privacy"]["description"]
-        assert "OpenAI" in privacy and "event log" in privacy and "Backups" in privacy and "shared" in privacy
+        assert "ai_account_privacy" not in self.steps
+        assert "consent_required" not in STRINGS["options"]["error"]
         signin = self.steps["ai_account_signin"]["description"]
+        assert "Requests send this home's climate data to OpenAI under the connected ChatGPT plan." in signin
         assert "{login_url}" in signin and "will fail to load" in signin and "expected" in signin
         assert "every zone" in signin
         done = self.steps["ai_account_done"]

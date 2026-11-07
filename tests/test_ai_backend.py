@@ -66,6 +66,9 @@ from custom_components.climate_advisor.const import (  # noqa: E402
 class FakeBackend:
     """Minimal backend: no SDK, records what the wrapper hands it."""
 
+    def for_request(self) -> FakeBackend:
+        return self
+
     def __init__(self, config: dict[str, Any], client: Any | None = None) -> None:
         self._config = config
         self.client = client or object()
@@ -131,6 +134,8 @@ async def _fake_validate(config: dict[str, Any], hass: Any | None = None) -> tup
 FAKE_SPEC = ProviderSpec(
     id="fake",
     label="Fake Router",
+    display_name="Fake Router",
+    api_name="Fake Router",
     credential_kind="api_key",
     build_backend=lambda config, client=None: FakeBackend(config, client),
     usage_url="https://example.invalid/usage",
@@ -142,6 +147,7 @@ FAKE_SPEC = ProviderSpec(
     list_models=_fake_list_models,
     validate_credentials=_fake_validate,
     settings_fields=("fake_key", "fake_model"),
+    credential_setting="fake_key",
     model_setting="fake_model",
 )
 
@@ -426,7 +432,7 @@ class TestOwnCredentialAndModelFields:
 
         ensure_providers_registered()
         assert get_provider("anthropic").credential_setting == "ai_api_key"
-        assert get_provider("chatgpt").credential_setting == "ai_api_key"  # unused: credential_kind is account
+        assert get_provider("chatgpt").credential_setting is None  # credential_kind is account
 
     def test_coordinator_gate_reads_the_providers_own_key(self, own_fields_provider):
         from custom_components.climate_advisor.coordinator import ClimateAdvisorCoordinator
@@ -664,6 +670,100 @@ def test_fallback_is_not_persisted_when_the_provider_changed_during_the_request(
     coordinator.async_persist_model_fallback.assert_not_awaited()
 
 
+def test_a_provider_must_declare_its_own_key_and_model_settings():
+    required = {f.name for f in dataclasses.fields(ProviderSpec) if f.default is dataclasses.MISSING}
+    assert {"credential_setting", "model_setting"} <= required
+
+
+def test_import_failure_of_the_sdk_of_any_kind_leaves_the_module_usable(monkeypatch):
+    """A broken ``anthropic`` raises more than ImportError (a pydantic mismatch, for one)."""
+    import importlib.util
+
+    class Broken:
+        def __getattr__(self, name):
+            raise TypeError("broken SDK")
+
+    monkeypatch.setitem(sys.modules, "anthropic", Broken())
+    name = "custom_components.climate_advisor._claude_api_probe"
+    spec = importlib.util.spec_from_file_location(name, claude_api.__file__)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    assert module.ANTHROPIC_AVAILABLE is False and module.NotFoundError is None
+
+
+def test_no_answer_is_not_replaced_by_a_fallback_report():
+    from custom_components.climate_advisor.ai_skills import AISkillDefinition, AISkillRegistry
+
+    fallback = MagicMock(return_value={})
+    registry = AISkillRegistry()
+    registry.register(
+        AISkillDefinition(
+            name="s",
+            description="d",
+            system_prompt="p",
+            context_builder=AsyncMock(return_value="c"),
+            response_parser=lambda raw: {},
+            fallback=fallback,
+        )
+    )
+    declined = ClaudeResponse(
+        success=False,
+        content="",
+        input_tokens=0,
+        output_tokens=0,
+        estimated_cost=0.0,
+        latency_ms=1.0,
+        error="declined",
+        no_answer=True,
+    )
+    client = MagicMock(async_request=AsyncMock(return_value=declined))
+    result = asyncio.run(registry.async_execute("s", MagicMock(config={}), MagicMock(config={}), client))
+    assert result["source"] == "error" and result["error"] == "declined"
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("config", "text"),
+    [({}, "Sending context to Claude AI…"), ({CONF_AI_PROVIDER: "fake"}, "Sending context to Fake Router…")],
+    ids=["claude", "other_provider"],
+)
+def test_sending_status_text(fake_provider, config, text):
+    from custom_components.climate_advisor.ai_skills import AISkillDefinition, AISkillRegistry
+
+    async def context(*_args, **_kwargs):
+        return "c"
+
+    async def stream(**_kwargs):
+        yield {"type": "text", "text": "x"}
+
+    registry = AISkillRegistry()
+    registry.register(
+        AISkillDefinition(
+            name="s", description="d", system_prompt="p", context_builder=context, response_parser=lambda raw: {}
+        )
+    )
+    client = MagicMock(async_request_streaming=stream)
+
+    async def go():
+        return [e async for e in registry.async_execute_streaming("s", MagicMock(), MagicMock(config=config), client)]
+
+    assert any(e.get("text") == text for e in asyncio.run(go()))
+
+
 def test_module_reexports_neutral_response():
     assert claude_api.ClaudeResponse is ClaudeResponse
     assert isinstance(FAKE_SPEC, ProviderSpec)
+
+
+def test_provider_imports_use_absolute_names(monkeypatch):
+    """HA's blocking-import check only passes a loaded module when given its absolute name."""
+    import importlib
+
+    from custom_components.climate_advisor import ai_providers
+
+    names: list[str] = []
+    monkeypatch.setattr(importlib, "import_module", lambda name, package=None: names.append(name))
+    ai_providers.ensure_providers_registered()
+    assert names
+    assert all(name.startswith("custom_components.climate_advisor.") for name in names)

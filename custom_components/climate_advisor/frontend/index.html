@@ -2891,7 +2891,7 @@
     fan: 'Fan',
     schedule: 'Schedule',
     advanced: 'Advanced',
-    ai_settings: 'AI Settings',
+    ai_settings: 'AI Settings (Claude)',
   };
   const CATEGORY_ORDER = ['core', 'setpoints', 'sensors', 'fan', 'schedule', 'advanced', 'ai_settings'];
 
@@ -2918,7 +2918,7 @@
       CATEGORY_ORDER.forEach(cat => {
         const items = grouped[cat];
         if (!items || items.length === 0) return;
-        const catLabel = CATEGORY_LABELS[cat] || cat;
+        const catLabel = cat === 'ai_settings' && items.some(s => s.key === 'ai_provider') ? 'AI Settings' : (CATEGORY_LABELS[cat] || cat);
         html += `<div class="settings-group"><h3>${catLabel}</h3>`;
         items.forEach(s => {
           const displayValue = s.value == null ? '<span style="color:var(--text-secondary)">not set</span>'
@@ -2974,11 +2974,13 @@
         budget_exceeded: 'var(--warning)',
         inactive: 'var(--text-secondary)',
         not_connected: 'var(--warning)',
+        reauth_required: 'var(--warning)',
       }[s.status] || 'var(--text-secondary)';
+      const statusValue = String(s.status || 'unknown');
 
       grid.innerHTML = `
         ${(s.provider_label && s.claude_wording !== true) ? `<div class="status-item"><div class="label">Provider</div><div class="value">${escapeHtml(String(s.provider_label))}</div></div>` : ''}
-        <div class="status-item"><div class="label">Status</div><div class="value" style="color:${statusColor}">${escapeHtml(String(s.status || 'unknown').replace(/_/g, ' ').toUpperCase())}</div></div>
+        <div class="status-item"><div class="label">Status</div><div class="value" style="color:${statusColor}">${escapeHtml((s.claude_wording === true ? statusValue : statusValue.replace(/_/g, ' ')).toUpperCase())}</div></div>
         <div class="status-item"><div class="label">Model</div><div class="value">${escapeHtml(s.model === '' ? 'not set' : String(s.model || 'n/a'))}</div></div>
         <div class="status-item"><div class="label">Total Requests</div><div class="value">${s.total_requests || 0}</div></div>
         <div class="status-item"><div class="label">Errors</div><div class="value" style="color:${(s.error_count || 0) > 0 ? 'var(--danger)' : 'inherit'}">${s.error_count || 0}</div></div>

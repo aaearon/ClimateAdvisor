@@ -237,21 +237,28 @@ async def _check_account_readiness(hass: HomeAssistant, manager: Any) -> str:
 
     ``not_ready`` is a temporary failure (429/5xx/network): credentials are kept. Never raises.
     """
-    from .ai_backend import CREDENTIAL_ACCOUNT, PROVIDERS, AIBackendError  # noqa: PLC0415
+    from .ai_backend import AIBackendError  # noqa: PLC0415
     from .ai_providers import async_ensure_providers_registered  # noqa: PLC0415
 
     try:
         await async_ensure_providers_registered(hass)
-        spec = next((s for s in PROVIDERS.values() if s.credential_kind == CREDENTIAL_ACCOUNT), None)
+        spec = _account_provider_spec()
         if spec is None:
             return "check_failed"
         backend = spec.build_backend({}, manager)
-        await backend._fetch_models()  # noqa: SLF001 - the one /v1/models probe
+        await backend.async_fetch_models()
     except AIBackendError as err:
         return "not_ready" if err.category in ("transient", "quota", "rate_limit") else "check_failed"
     except Exception:  # noqa: BLE001 - a readiness probe must never fail the sign-in
         return "not_ready"
     return "ready"
+
+
+def _account_provider_spec() -> Any:
+    """The registered account provider (the one whose credentials are a shared sign-in), or None."""
+    from .ai_backend import CREDENTIAL_ACCOUNT, PROVIDERS  # noqa: PLC0415
+
+    return next((s for s in PROVIDERS.values() if s.credential_kind == CREDENTIAL_ACCOUNT), None)
 
 
 TEMP_UNIT_OPTIONS = [
@@ -2130,11 +2137,14 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
         # Build masked key status placeholder for description
         existing_key = current.get(key_field, "")
         if not uses_key:
-            key_status = "Not used"
+            status_lines = (
+                f"Provider: {spec.label}\n"
+                f"After you save, you can sign in with {spec.display_name} (or disconnect) on the next screen."
+            )
         elif existing_key:
-            key_status = "••••" + existing_key[-4:] if len(existing_key) > 4 else "••••"
+            status_lines = "API Key Status: " + ("••••" + existing_key[-4:] if len(existing_key) > 4 else "••••")
         else:
-            key_status = "Not configured"
+            status_lines = "API Key Status: Not configured"
 
         # Issue #563: populate the dropdown from the provider's live model registry
         # instead of a hardcoded list, so newly released models appear without a CA code
@@ -2256,12 +2266,10 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema(fields),
             errors=errors,
             description_placeholders={
-                "key_status": key_status,
-                "provider_label": spec.label,
+                "display_name": spec.display_name,
+                "api_name": spec.api_name,
+                "status_lines": status_lines,
                 "investigator_note": "Each investigation uses extended thinking. " if spec.uses_claude_wording else "",
-                "account_hint": ""
-                if uses_key
-                else "After you save, you can sign in with ChatGPT (or disconnect) on the next screen.",
             },
         )
 
@@ -2295,52 +2303,23 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
         manager = await self._account_manager()
         info = manager.status()
         state = info.get("state")
+        spec = _account_provider_spec()
+        name = spec.display_name if spec is not None else "the AI account"
         if state == "connected":
             who = f" as {info['email']}" if info.get("email") else ""
-            summary = f"Connected to ChatGPT{who}."
+            summary = f"Connected to {name}{who}."
             options = ["ai_account_disconnect", "init"]
         else:
             summary = (
-                "Your ChatGPT sign-in expired or was revoked, so AI features are paused."
+                f"Your {name} sign-in expired or was revoked, so AI features are paused."
                 if state == "reauth_required"
                 else "The last sign-in could not be confirmed as saved. Signing in again checks it first."
                 if state == "save_uncertain"
-                else "No ChatGPT account is connected."
+                else f"No {name} account is connected."
             )
-            options = ["ai_account_privacy", "init"]
+            options = ["ai_account_signin", "init"]
         return self.async_show_menu(
             step_id="ai_account", menu_options=options, description_placeholders={"account_summary": summary}
-        )
-
-    async def async_step_ai_account_privacy(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.ConfigFlowResult:
-        """What is sent and to whom, plus the affirmative choice to sign in."""
-        from .ai_account import AccountLoginError  # noqa: PLC0415
-        from .ai_backend import AIBackendError  # noqa: PLC0415
-
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            if not user_input.get(CONF_AI_ACCOUNT_CONSENT):
-                errors["base"] = "consent_required"
-            elif _current_user_id() is None:
-                errors["base"] = "owner_required"
-            else:
-                manager = await self._account_manager()
-                try:
-                    self._login_url = await manager.async_begin_login()
-                    self._login_id = manager.pending_login_id  # read before any await: it is ours
-                except AccountLoginError as err:
-                    errors["base"] = self._login_error_key(err.reason)
-                except AIBackendError:
-                    errors["base"] = "login_failed"
-                else:
-                    self._login_open = True
-                    return await self.async_step_ai_account_signin()
-        return self.async_show_form(
-            step_id="ai_account_privacy",
-            data_schema=vol.Schema({vol.Required("ai_account_consent", default=False): selector.BooleanSelector()}),
-            errors=errors,
         )
 
     async def async_step_ai_account_signin(
@@ -2351,8 +2330,22 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
         from .ai_backend import AIBackendError  # noqa: PLC0415
 
         errors: dict[str, str] = {}
-        if user_input is not None:
-            manager = await self._account_manager()
+        manager = await self._account_manager()
+        if user_input is None or not self._login_open:
+            # Opening the step, or submitting after a link could not be made: make one now.
+            self._login_url = ""
+            if _current_user_id() is None:
+                errors["base"] = "owner_required"
+            else:
+                try:
+                    self._login_url = await manager.async_begin_login()
+                    self._login_id = manager.pending_login_id  # read before any await: it is ours
+                    self._login_open = True
+                except AccountLoginError as err:
+                    errors["base"] = self._login_error_key(err.reason)
+                except AIBackendError:
+                    errors["base"] = "login_failed"
+        else:
             owner = _current_user_id()
             reason: str | None = None
             if owner is None:

@@ -44,12 +44,10 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .ai_backend import AIBackendError
-from .const import DOMAIN
+from .const import AI_ACCOUNT_HASS_KEY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Never hass.data[DOMAIN], which must contain only coordinators.
-ACCOUNT_DATA_KEY = "climate_advisor_ai_account"
 STORAGE_VERSION = 1
 STORAGE_KEY = "climate_advisor.ai_account"
 MAX_TOKEN_LENGTH = 16384
@@ -231,7 +229,11 @@ def _error_code(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
     err = payload.get("error")
-    candidates = (err.get("code"),) if isinstance(err, dict) else (err, payload.get("code"), payload.get("error_code"))
+    candidates = (
+        (err.get("code"), err.get("type"))
+        if isinstance(err, dict)
+        else (err, payload.get("code"), payload.get("error_code"))
+    )
     for code in candidates:
         if isinstance(code, str) and _SAFE_CODE.match(code):
             return code
@@ -461,6 +463,12 @@ class ChatGPTAccountManager:
         return self._owner_user_id
 
     @property
+    def account_identity(self) -> tuple[str | None, str] | None:
+        """Who holds the account: (owner, subject), unchanged by a token rotation. None when no one."""
+        creds = self._credentials
+        return (self._owner_user_id, creds.subject) if creds is not None else None
+
+    @property
     def host_id(self) -> str | None:
         """This HA box's stable ``ext_agent_host_id``. Not for status or logs."""
         return self._host_id
@@ -541,9 +549,6 @@ class ChatGPTAccountManager:
         self._loaded = True
         if self._state == STATE_REAUTH_REQUIRED:
             self._create_reauth_issue()
-        if not self._host_id:
-            self._host_id = f"urn:uuid:{uuid.uuid4()}"
-            await self._persist_or_mark_dirty()
 
     async def _read_store(self) -> Any:
         try:
@@ -914,6 +919,9 @@ class ChatGPTAccountManager:
             await self._reconcile_uncertain_login()
             if self._state == STATE_CONNECTED:
                 raise AccountLoginError("already_connected")
+            if not self._host_id:  # the first use of an account: nothing is written before this
+                self._host_id = f"urn:uuid:{uuid.uuid4()}"
+                await self._persist_or_mark_dirty()
             verifier, state, nonce = secrets.token_urlsafe(64), secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             client_id = self._issued_client_id or _BOOTSTRAP_CLIENT_ID
             params = {"client_id": client_id}
@@ -1229,8 +1237,8 @@ class ChatGPTAccountManager:
             outcome = await self._revoke_and_forget()
             await self._erase_store()
             self._closed = True
-            if self.hass.data.get(ACCOUNT_DATA_KEY) is self:
-                self.hass.data.pop(ACCOUNT_DATA_KEY)
+            if self.hass.data.get(AI_ACCOUNT_HASS_KEY) is self:
+                self.hass.data.pop(AI_ACCOUNT_HASS_KEY)
             final = REVOCATION_UNCONFIRMED if unread else outcome
             _LOGGER.info("ChatGPT account removed (revocation: %s)", final)
             return final
@@ -1316,10 +1324,10 @@ class ChatGPTAccountManager:
 
 def get_account_manager(hass: HomeAssistant) -> ChatGPTAccountManager:
     """The instance's manager, created if needed. Not loaded yet: each operation loads on demand."""
-    manager = hass.data.get(ACCOUNT_DATA_KEY)
+    manager = hass.data.get(AI_ACCOUNT_HASS_KEY)
     if manager is None:
         manager = ChatGPTAccountManager(hass)
-        hass.data[ACCOUNT_DATA_KEY] = manager
+        hass.data[AI_ACCOUNT_HASS_KEY] = manager
     return manager
 
 

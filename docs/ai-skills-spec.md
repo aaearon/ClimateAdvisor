@@ -175,7 +175,7 @@ The pipeline is provider-neutral; `claude_client` is a `ClaudeAPIClient` whichev
 
 - **Options:** per-request model/tokens/reasoning come from `ProviderSpec.resolve_request_options` (see step 3 above), not from reading Anthropic config directly.
 - **Streaming status text:** the first SSE `status` event names the provider (`Sending context to <provider label>…`), falling back to "the AI provider" for an unknown id.
-- **Partial reports:** a ChatGPT stream that fails, is incomplete or is interrupted raises before the final `stop` event, so the streaming path in `api.py` never stores a partial report. Only a `response.completed` event is success.
+- **Partial reports:** a ChatGPT stream that fails, is incomplete, unreadable, refused, empty or interrupted raises before the final `stop` event, so the streaming path in `api.py` never stores a partial or blank report. Only a `response.completed` event with text is success. A refusal or empty answer also gets no fallback report on the non-streaming path.
 - **`truncated`:** the ChatGPT backend always reports `stop_reason="end_turn"`, so `truncated` is never `True` for it. Its output length cannot be capped from our side (no output-limit parameter is sent), so a cut-off cannot be distinguished by this field.
 - **Who may run it:** for a `plan_restricted` provider (ChatGPT), `ClimateAdvisorInvestigateView` returns 403 unless the requester is the connected account's owner, checked before rate counters and context gathering on both the streaming and non-streaming paths; the client also refuses any `triggered_by` other than `"manual"`.
 

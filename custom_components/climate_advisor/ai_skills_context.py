@@ -1264,7 +1264,7 @@ async def build_config_context(hass: Any, coordinator: Any, **kwargs: Any) -> st
         cfg: dict[str, Any] = dict(coordinator.config or {})
         spec = get_provider(cfg.get("ai_provider", DEFAULT_AI_PROVIDER))
         cfg.pop("ai_api_key", None)
-        if spec is not None:
+        if spec is not None and spec.credential_setting:
             cfg.pop(spec.credential_setting, None)
 
         # Issue #1048: config temperatures are internal degF; show them in the user's unit.

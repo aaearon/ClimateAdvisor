@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from custom_components.climate_advisor import config_flow
 from custom_components.climate_advisor.ai_backend import PROVIDERS, get_provider
@@ -45,6 +49,13 @@ class TestRegistration:
         assert {"anthropic", "chatgpt"} <= set(PROVIDERS)
         assert get_provider("chatgpt").credential_kind == "account"
 
+    @pytest.mark.parametrize("broken", ["chatgpt_backend", "claude_api"])
+    def test_one_provider_failing_to_import_does_not_block_the_rest(self, monkeypatch, caplog, broken):
+        monkeypatch.setitem(sys.modules, f"custom_components.climate_advisor.{broken}", None)
+        with caplog.at_level(logging.ERROR):
+            ensure_providers_registered()
+        assert broken in caplog.text
+
     def test_ai_backend_imports_no_provider(self):
         text = (PKG / "ai_backend.py").read_text(encoding="utf-8")
         assert "from .chatgpt_backend" not in text and "from .claude_api" not in text
@@ -74,8 +85,20 @@ class TestAiSettingsFields:
         assert "ai_api_key" not in keys
         assert not keys & {"ai_temperature", "ai_max_tokens", "ai_monthly_budget", "ai_reasoning_effort", "ai_model"}
         assert "ai_enabled" in keys and "ai_provider" not in keys
-        assert "sign in with ChatGPT" in result["description_placeholders"]["account_hint"]
-        assert "panel" not in result["description_placeholders"]["account_hint"]
+        status = result["description_placeholders"]["status_lines"]
+        assert "sign in with ChatGPT" in status and "panel" not in status
+
+    def test_claude_zone_keeps_the_original_wording(self):
+        result, *_ = _step({**FULL_CONFIG_V12, "ai_api_key": "sk-ant-abcd1234"})
+        strings = json.loads((PKG / "strings.json").read_text(encoding="utf-8"))["options"]
+        placeholders = result["description_placeholders"]
+        description = strings["step"]["ai_settings"]["description"].format(**placeholders)
+        assert description == (
+            "Configure Claude AI integration for intelligent analysis and reporting.\nAPI Key Status: ••••1234"
+        )
+        assert strings["error"]["ai_connection_failed"].format(**placeholders) == (
+            "Could not connect to Claude API. Check your API key and try again."
+        )
 
     def test_unknown_provider_still_renders_anthropic_form(self):
         result, *_ = _step({**FULL_CONFIG_V12, "ai_provider": "nope"})
@@ -317,3 +340,16 @@ class TestProviderOwnModelKey:
         spec = self._fake(monkeypatch)
         rows = _provider_ai_rows(spec, "ai_model", {"category": "ai"}, {"fake_model": "fake/m"}, None)
         assert [(r["key"], r["value"]) for r in rows] == [("fake_model", "fake/m")]
+
+
+class TestAccountStateInStatus:
+    @pytest.mark.parametrize(
+        ("state", "status"),
+        [("connected", "active"), ("disconnected", "not_connected"), ("reauth_required", "reauth_required")],
+    )
+    def test_status_reports_the_real_account_state(self, state, status):
+        from custom_components.climate_advisor.claude_api import ClaudeAPIClient
+
+        manager = MagicMock(state=state)
+        config = {"ai_enabled": True, "ai_provider": "chatgpt", "ai_chatgpt_model": "m"}
+        assert ClaudeAPIClient(config, manager).get_status()["status"] == status

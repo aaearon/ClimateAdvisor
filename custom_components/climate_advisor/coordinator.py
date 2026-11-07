@@ -1934,7 +1934,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         """
         from .ai_providers import ensure_providers_registered  # noqa: PLC0415
 
-        ensure_providers_registered()
+        try:
+            ensure_providers_registered()
+        except Exception:  # noqa: BLE001 - an AI failure must never fail setup (HVAC keeps running)
+            _LOGGER.exception("AI providers could not be loaded; continuing without AI")
+            return False
         spec = get_provider(config.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
         if spec is None:
             return True
@@ -1995,10 +1999,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             except Exception:  # noqa: BLE001 - an AI failure must never fail setup (HVAC keeps running)
                 _LOGGER.exception("AI subsystem could not be initialized; continuing without AI")
                 self.claude_client = None
-            _LOGGER.info(
-                "AI subsystem initialized — model: %s",
-                ai_client_config.get(spec.model_setting if spec else CONF_AI_MODEL, "unknown"),
-            )
+            else:
+                _LOGGER.info(
+                    "AI subsystem initialized — model: %s",
+                    ai_client_config.get(spec.model_setting if spec else CONF_AI_MODEL, "unknown"),
+                )
             self._ai_client_config = None
         # Issue #543: chart_log.load() does blocking file I/O — offload to executor.
         await self._executor_job(self._chart_log.load)

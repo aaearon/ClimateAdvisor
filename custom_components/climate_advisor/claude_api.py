@@ -63,7 +63,7 @@ try:
     from anthropic import APIError, APITimeoutError, AsyncAnthropic, RateLimitError
 
     ANTHROPIC_AVAILABLE = True
-except ImportError:
+except Exception:  # noqa: BLE001 - a broken SDK raises more than ImportError; AI must never fail setup
     ANTHROPIC_AVAILABLE = False
     AsyncAnthropic = None  # type: ignore[assignment,misc]
     APIError = Exception  # type: ignore[assignment,misc]
@@ -77,7 +77,7 @@ try:
     # doesn't expose it, NotFoundError just never matches and behavior falls
     # through to today's generic APIError handling unchanged.
     from anthropic import NotFoundError
-except ImportError:
+except Exception:  # noqa: BLE001 - as above
     NotFoundError = None  # type: ignore[assignment,misc]
 
 # Issue #563 — capability-tier keywords used for substring-matching a model ID to its
@@ -124,6 +124,7 @@ class ClaudeResponse:
     # max_tokens budget was consumed without producing an answer (Issue #563 follow-on).
     # A distinct condition from ordinary truncation: there is no partial content to
     # salvage, and raising max_tokens further may not even be the right lever.
+    no_answer: bool = False  # the model refused or returned nothing: shown as an error, no fallback report
     no_retry: bool = False  # failure the backend flagged AIBackendError.no_retry: not retried,
     # not counted toward the circuit breaker
     resolved_model: str = ""  # actual model used; differs from the requested model only
@@ -252,6 +253,10 @@ class AnthropicBackend:
             return "Anthropic client not initialized (missing package or API key)"
         return None
 
+    def for_request(self) -> AnthropicBackend:
+        """The key cannot change hands mid-request in a way that matters: no binding needed."""
+        return self
+
     def update_config(self, config: dict[str, Any]) -> None:
         """Apply updated config; the SDK client is recreated if the API key changed."""
         old_key = self._config.get(CONF_AI_API_KEY, "")
@@ -270,6 +275,10 @@ class AnthropicBackend:
     async def async_list_models(self) -> list[str]:
         """Return live Claude model IDs (static fallback on failure)."""
         return await fetch_available_models(self._config.get(CONF_AI_API_KEY, ""))
+
+    async def async_fetch_models(self) -> list[str]:
+        """Live Claude model IDs; the lookup falls back to the static list, so it does not raise."""
+        return await self.async_list_models()
 
     async def async_test_connection(self, hass: Any | None = None) -> tuple[bool, str]:
         """Validate the configured API key with a minimal API call.
@@ -657,6 +666,8 @@ async def _anthropic_validate_credentials(config: dict[str, Any], hass: Any | No
 ANTHROPIC_SPEC = ProviderSpec(
     id="anthropic",
     label="Anthropic Claude",
+    display_name="Claude AI",
+    api_name="Claude API",
     credential_kind=CREDENTIAL_API_KEY,
     build_backend=AnthropicBackend,
     usage_url="https://console.anthropic.com/settings/usage",
@@ -675,6 +686,7 @@ ANTHROPIC_SPEC = ProviderSpec(
         CONF_AI_TEMPERATURE,
         CONF_AI_MONTHLY_BUDGET,
     ),
+    credential_setting=CONF_AI_API_KEY,
     uses_claude_wording=True,
     model_setting=CONF_AI_MODEL,
     default_model=DEFAULT_AI_MODEL,
@@ -795,7 +807,7 @@ class ClaudeAPIClient:
             )
 
         if not self._check_circuit_breaker():
-            _LOGGER.warning("Claude API circuit breaker is open; skipping request")
+            _LOGGER.warning("%s circuit breaker is open; skipping request", self._api_name)
             return ClaudeResponse(
                 success=False,
                 content="",
@@ -810,8 +822,9 @@ class ClaudeAPIClient:
         # Guard: rate limiter
         if not self._check_rate_limit(triggered_by):
             _LOGGER.warning(
-                "Daily %s request limit reached; skipping Claude API call",
+                "Daily %s request limit reached; skipping %s call",
                 triggered_by,
+                self._api_name,
             )
             return ClaudeResponse(
                 success=False,
@@ -826,7 +839,7 @@ class ClaudeAPIClient:
 
         # Guard: monthly budget
         if not self._check_budget():
-            _LOGGER.warning("Monthly AI budget exceeded; skipping Claude API call")
+            _LOGGER.warning("Monthly AI budget exceeded; skipping %s call", self._api_name)
             return ClaudeResponse(
                 success=False,
                 content="",
@@ -850,7 +863,7 @@ class ClaudeAPIClient:
                 error=inactive_reason,
             )
 
-        spec, backend = self._spec, self._backend
+        spec, backend = self._spec, self._backend.for_request()
         options = self._resolve_options(max_tokens, temperature, model, reasoning_effort)
         response = await self._async_call_with_retry(
             spec=spec,
@@ -970,7 +983,7 @@ class ClaudeAPIClient:
         if inactive_reason is not None:
             raise RuntimeError(inactive_reason)
 
-        spec, backend = self._spec, self._backend
+        spec, backend = self._spec, self._backend.for_request()
         options = self._resolve_options(max_tokens, temperature, model, reasoning_effort)
         resolved_model = options["model"]
 
@@ -1113,6 +1126,8 @@ class ClaudeAPIClient:
             status = "error"  # unknown provider id: no AI, but never a setup failure
         elif account_state == "disconnected":
             status = "not_connected"
+        elif account_state == "reauth_required":
+            status = "reauth_required"
         elif self._circuit_breaker.state == _CB_OPEN:
             status = "circuit_open"
         elif not self._check_budget():
@@ -1243,6 +1258,11 @@ class ClaudeAPIClient:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @property
+    def _api_name(self) -> str:
+        """The name logs use for this zone's AI service."""
+        return self._spec.api_name if self._spec is not None else "AI API"
 
     @property
     def _client(self) -> Any:
@@ -1560,7 +1580,7 @@ class ClaudeAPIClient:
 
             except AIBackendError as exc:
                 if exc.no_retry:
-                    _LOGGER.warning("Claude API request not retried: %s", exc)
+                    _LOGGER.warning("%s request not retried: %s", spec.api_name, exc)
                     return ClaudeResponse(
                         success=False,
                         content="",
@@ -1570,11 +1590,13 @@ class ClaudeAPIClient:
                         latency_ms=(time.monotonic() - start_time) * 1000.0,
                         error=f"API error: {exc}",
                         no_retry=True,
+                        no_answer=exc.no_answer,
                     )
                 if exc.category == "rate_limit":
                     last_error = f"Rate limit error: {exc}"
                     _LOGGER.warning(
-                        "Claude API rate limit on attempt %d/%d: %s",
+                        "%s rate limit on attempt %d/%d: %s",
+                        spec.api_name,
                         attempt,
                         AI_MAX_RETRIES,
                         exc,
@@ -1582,7 +1604,8 @@ class ClaudeAPIClient:
                 elif exc.timeout:
                     last_error = f"Timeout error: {exc}"
                     _LOGGER.warning(
-                        "Claude API timeout on attempt %d/%d: %s",
+                        "%s timeout on attempt %d/%d: %s",
+                        spec.api_name,
                         attempt,
                         AI_MAX_RETRIES,
                         exc,
@@ -1621,7 +1644,8 @@ class ClaudeAPIClient:
                         )
                     last_error = f"API error: {exc}"
                     _LOGGER.warning(
-                        "Claude API error on attempt %d/%d: %s",
+                        "%s error on attempt %d/%d: %s",
+                        spec.api_name,
                         attempt,
                         AI_MAX_RETRIES,
                         exc,
@@ -1629,7 +1653,8 @@ class ClaudeAPIClient:
             except Exception as exc:  # noqa: BLE001
                 last_error = f"Unexpected error: {exc}"
                 _LOGGER.warning(
-                    "Unexpected error calling Claude API on attempt %d/%d: %s",
+                    "Unexpected error calling %s on attempt %d/%d: %s",
+                    spec.api_name,
                     attempt,
                     AI_MAX_RETRIES,
                     exc,
@@ -1642,7 +1667,8 @@ class ClaudeAPIClient:
 
         latency_ms = (time.monotonic() - start_time) * 1000.0
         _LOGGER.error(
-            "Claude API request failed after %d attempts; last error: %s",
+            "%s request failed after %d attempts; last error: %s",
+            spec.api_name,
             AI_MAX_RETRIES,
             last_error,
         )

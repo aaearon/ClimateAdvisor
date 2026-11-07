@@ -579,18 +579,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register the built-in AI providers (ai_backend imports none) before the coordinator's AI gate
     # and the options flow look them up; first-time imports run in the executor.
-    await async_ensure_providers_registered(hass)
-
     # Shared ChatGPT account manager: created and LOADED on the event loop before the coordinator
     # restores state (the coordinator hands the loaded manager to its AI client by plain
     # reference). Lives at hass.data[AI_ACCOUNT_HASS_KEY], never in hass.data[DOMAIN]. An AI
     # failure must never fail setup, so HVAC automation keeps running.
     try:
+        await async_ensure_providers_registered(hass)
+
         from .ai_account import async_get_account_manager  # noqa: PLC0415
 
         await async_get_account_manager(hass)
     except Exception:  # noqa: BLE001
-        _LOGGER.exception("ChatGPT account manager could not be loaded; continuing without it")
+        _LOGGER.exception("AI providers could not be loaded; continuing without AI")
 
     coordinator = ClimateAdvisorCoordinator(hass, dict(entry.data), entry_id=entry.entry_id)
 

@@ -156,6 +156,8 @@ class AISkillRegistry:
             name,
             response.error or "parse error",
         )
+        if response.no_answer is True:  # the model was reached and declined: say so, no stand-in report
+            return _error_result(response.error, input_context=context)
         if skill.fallback:
             return _run_fallback(skill, coordinator, context=context, **kwargs)
 
@@ -226,7 +228,8 @@ class AISkillRegistry:
 
         cfg: dict[str, Any] = getattr(coordinator, "config", {}) or {}
         label_spec = get_provider(cfg.get(CONF_AI_PROVIDER, DEFAULT_AI_PROVIDER))
-        yield {"type": "status", "text": f"Sending context to {label_spec.label if label_spec else 'the AI provider'}…"}
+        provider_name = "the AI provider" if label_spec is None else label_spec.display_name
+        yield {"type": "status", "text": f"Sending context to {provider_name}…"}
 
         spec, options = _resolve_skill_options(skill, cfg)
         override_model = options.get("model")

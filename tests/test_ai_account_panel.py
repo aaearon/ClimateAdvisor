@@ -57,7 +57,9 @@ def test_monthly_cost_hidden_for_non_cost_providers():
 
 
 def test_no_hardcoded_claude_label_left_in_ai_settings():
-    assert "AI Settings (Claude)" not in HTML
+    # Only the Claude zone's title names Claude: any other provider's zone has an "AI Provider" row.
+    assert "ai_settings: 'AI Settings (Claude)'" in HTML
+    assert "items.some(s => s.key === 'ai_provider') ? 'AI Settings'" in HTML
     assert "Claude's reasoning" not in HTML
 
 
@@ -159,6 +161,8 @@ def test_fake_api_key_provider_gets_key_row_and_its_capabilities(monkeypatch):
         base,
         id="fakekey",
         label="Fake Router",
+        display_name="Fake Router",
+        api_name="Fake Router",
         tracks_cost=True,
         supports_tuning=False,
         plan_restricted=False,
@@ -185,6 +189,8 @@ def test_provider_with_its_own_key_field_shows_that_field_and_never_its_value(mo
         PROVIDERS["anthropic"],
         id="ownkey",
         label="Own Key Router",
+        display_name="Own Key Router",
+        api_name="Own Key Router",
         uses_claude_wording=False,
         settings_fields=("ai_ownkey_key", "ai_ownkey_model"),
         credential_setting="ai_ownkey_key",
@@ -200,6 +206,14 @@ def test_provider_with_its_own_key_field_shows_that_field_and_never_its_value(mo
 
     rows, _ = _ai_rows({"ai_provider": "ownkey", "ai_api_key": "claude-secret"})
     assert {r["key"]: r for r in rows}["ai_ownkey_key"]["value"] == "not set"
+
+
+def test_status_label_keeps_underscores_only_for_claude_zones():
+    assert "s.claude_wording === true ? statusValue : statusValue.replace(/_/g, ' ')" in HTML
+
+
+def test_reauth_status_is_coloured_as_a_warning():
+    assert "reauth_required: 'var(--warning)'" in HTML
 
 
 def test_ai_status_model_is_what_is_sent_per_provider():

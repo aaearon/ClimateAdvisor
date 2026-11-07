@@ -29,6 +29,8 @@ class AIBackendError(Exception):
     log/error wording only) and ``model_not_found`` marks a rejected model id
     (eligible for tier fallback when the provider supports it). ``no_retry`` marks a
     failure the wrapper must neither retry nor count toward the circuit breaker.
+    ``no_answer`` marks a request the model refused or left empty: the user sees the
+    error, and no fallback report replaces the answer.
     """
 
     def __init__(
@@ -39,6 +41,7 @@ class AIBackendError(Exception):
         timeout: bool = False,
         model_not_found: bool = False,
         no_retry: bool = False,
+        no_answer: bool = False,
     ) -> None:
         if category not in ERROR_CATEGORIES:
             raise ValueError(f"Unknown AIBackendError category: {category}")
@@ -47,6 +50,7 @@ class AIBackendError(Exception):
         self.timeout = timeout
         self.model_not_found = model_not_found
         self.no_retry = no_retry
+        self.no_answer = no_answer
 
 
 class AIUserNotAllowedError(Exception):
@@ -68,6 +72,14 @@ class AIBackend(Protocol):
     """
 
     client: Any  # underlying SDK/transport object, or None when inactive
+
+    def for_request(self) -> AIBackend:
+        """The backend one request uses, taken at dispatch and kept through its retries.
+
+        A provider whose credentials can change hands returns one bound to the current holder,
+        which fails with ``no_retry`` once that holder changes. Others return ``self``.
+        """
+        ...
 
     @property
     def inactive_reason(self) -> str | None:
@@ -96,7 +108,13 @@ class AIBackend(Protocol):
         reasoning_effort: str,
     ) -> AsyncIterator[dict[str, Any]]: ...
 
-    async def async_list_models(self) -> list[str]: ...
+    async def async_list_models(self) -> list[str]:
+        """Model ids for a picker; never raises (falls back to a static list or an empty one)."""
+        ...
+
+    async def async_fetch_models(self) -> list[str]:
+        """Live model ids; raises ``AIBackendError`` when the provider cannot be reached (a readiness probe)."""
+        ...
 
     async def async_test_connection(self, hass: Any | None = None) -> tuple[bool, str]: ...
 
@@ -109,6 +127,10 @@ class ProviderSpec:
 
     id: str
     label: str
+    # How the provider is named in sentences (status text, settings intro): "Claude AI", "ChatGPT".
+    display_name: str
+    # The provider's API as named in a connection error: "Claude API", "ChatGPT".
+    api_name: str
     credential_kind: str  # CREDENTIAL_API_KEY | CREDENTIAL_ACCOUNT
     # (config, client=None) -> AIBackend; may block (called in the executor).
     build_backend: Callable[..., AIBackend]
@@ -124,15 +146,16 @@ class ProviderSpec:
     # (config, hass) -> (ok, message)
     validate_credentials: Callable[[dict[str, Any], Any | None], Awaitable[tuple[bool, str]]]
     settings_fields: tuple[str, ...]  # config keys this provider's settings own
-    # True only where the shared AI settings rows may keep their Claude/Anthropic wording.
-    uses_claude_wording: bool = False
-    # The config key holding this provider's API key (credential_kind == api_key only); the options
-    # flow, settings rows, diagnostics redaction and coordinator gate read it from here. A backend
-    # reads its own key from the config it is given.
-    credential_setting: str = "ai_api_key"
+    # The config key holding this provider's API key (None for an account provider). The options
+    # flow, settings rows, diagnostics redaction and coordinator gate read it from here; a backend
+    # reads its own key from the config it is given. No default: a new provider must never be
+    # handed another provider's key.
+    credential_setting: str | None
     # The config key holding this provider's chosen model; the options flow, settings rows and
     # ``configured_model`` all read it from here. Must be one of ``settings_fields``.
-    model_setting: str = "ai_model"
+    model_setting: str
+    # True only where the shared AI settings rows may keep their Claude/Anthropic wording.
+    uses_claude_wording: bool = False
     # Model preselected when none is saved, and the list shown when the live list is unavailable.
     default_model: str = ""
     fallback_models: tuple[str, ...] = ()

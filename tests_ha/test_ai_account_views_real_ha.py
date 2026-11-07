@@ -94,11 +94,9 @@ async def test_admin_signs_in_through_options_flow_http_and_owner_is_the_request
         assert step["step_id"] == "ai_settings"
         step = await _post(http, f"{FLOW}/{step['flow_id']}", {"ai_enabled": True})
         assert step["type"] == "menu" and step["step_id"] == "ai_account"
-        assert step["menu_options"] == ["ai_account_privacy", "init"]
+        assert step["menu_options"] == ["ai_account_signin", "init"]
 
-        step = await _post(http, f"{FLOW}/{step['flow_id']}", {"next_step_id": "ai_account_privacy"})
-        assert step["step_id"] == "ai_account_privacy"
-        step = await _post(http, f"{FLOW}/{step['flow_id']}", {"ai_account_consent": True})
+        step = await _post(http, f"{FLOW}/{step['flow_id']}", {"next_step_id": "ai_account_signin"})
         assert step["step_id"] == "ai_account_signin"
         assert step["description_placeholders"]["login_url"] == LOGIN_URL
 
@@ -156,8 +154,7 @@ async def test_abandoned_options_flow_cancels_the_pending_login(hass: HomeAssist
         step = await _post(http, f"{FLOW}/{flow_id}", {"next_step_id": "ai_provider"})
         step = await _post(http, f"{FLOW}/{flow_id}", {"ai_provider": "chatgpt"})
         step = await _post(http, f"{FLOW}/{flow_id}", {"ai_enabled": True})
-        step = await _post(http, f"{FLOW}/{flow_id}", {"next_step_id": "ai_account_privacy"})
-        step = await _post(http, f"{FLOW}/{flow_id}", {"ai_account_consent": True})
+        step = await _post(http, f"{FLOW}/{flow_id}", {"next_step_id": "ai_account_signin"})
         assert step["step_id"] == "ai_account_signin"
         resp = await http.delete(f"{FLOW}/{flow_id}")
         assert resp.status == 200
