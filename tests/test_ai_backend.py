@@ -767,3 +767,20 @@ def test_provider_imports_use_absolute_names(monkeypatch):
     ai_providers.ensure_providers_registered()
     assert names
     assert all(name.startswith("custom_components.climate_advisor.") for name in names)
+
+
+def test_investigator_fallback_names_the_zones_provider():
+    from types import SimpleNamespace
+
+    from custom_components.climate_advisor.ai_providers import ensure_providers_registered
+    from custom_components.climate_advisor.ai_skills_investigator import investigation_fallback
+
+    ensure_providers_registered()
+    expected = {
+        "anthropic": "AI unavailable — hypotheses require cross-source analysis by Claude.",
+        "chatgpt": "AI unavailable — hypotheses require cross-source analysis by the AI provider.",
+    }
+    for provider, text in expected.items():
+        result = investigation_fallback(SimpleNamespace(config={"ai_provider": provider}))
+        assert result["hypotheses"] == text
+    assert investigation_fallback(SimpleNamespace(config={}))["hypotheses"] == expected["anthropic"]
