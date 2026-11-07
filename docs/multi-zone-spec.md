@@ -340,6 +340,44 @@ are the same bug in three files, not three distinct designs.
   `LearningEngine.load_state()` (`learning.py:701`) calls it before checking
   whether its (now-resolved) path exists.
 
+  **Investigation reports (aaearon/ClimateAdvisor#2, the file PR6 missed):**
+  `climate_advisor_investigation_reports_<entry_id>.json`, through
+  `resolve_entry_scoped_path()`, read and written only by that zone's coordinator.
+  `migrate_legacy_storage_file()` is deliberately not used for the old shared
+  file. Handing it to whichever zone starts first would show every zone's reports
+  under one arbitrary zone, and those reports would go when that zone is removed.
+  Instead `investigation_report_migration.migrate_shared_reports()`, called from
+  `async_restore_state()` before the load on AI-enabled zones:
+  - A report has no zone field, but its stored `result.input_context` names its
+    thermostat (`=== HVAC ENTITY ===` section, plus the diagnostic footer on newer
+    reports), and each zone has its own thermostat (the config flow's unique_id).
+    A report goes to the one zone with that thermostat. With a single configured
+    zone, every report goes to it. Otherwise it goes to no zone: thermostat changed
+    or removed, no context, conflicting names, or two zones on one thermostat.
+  - The original bytes are always kept in
+    `climate_advisor_investigation_reports_legacy_shared.json` (`.1.json` etc. if a
+    later shared file differs; never overwritten, never deleted by the integration,
+    safe for the user to delete). That is the only home of unplaced reports, and a
+    warning logs their count.
+  - One attempt per Home Assistant run, gated in `hass.data`: the first AI zone to
+    start splits the file for all configured zones, and every other zone waits for
+    it before loading. Zones with AI off hold no reports in memory, so a zone that
+    first enables AI later in the run can still make the attempt. There is no retry
+    during a run, because it would write the file of a zone already loaded and that
+    zone's next save would overwrite it.
+  - Order: parse every target zone file, write the backup, stage each zone's merged
+    content in a synced temp file, replace the zone files, unlink the shared file.
+    A failure before the replacing leaves every zone file untouched, the shared file
+    stays, and the next Home Assistant start repeats the work, merging by timestamp
+    with whatever the zones saved meanwhile. A corrupt shared
+    file is moved to the backup name. Errors are logged, never raised into setup.
+    The remaining window is described in `docs/state-persistence.md`.
+
+  `POST /delete_report` was already scoped: it resolves one coordinator through
+  `_get_coordinator()` and refuses (400) when there is no `entry_id` and several
+  zones. As with the other scoped files, there is no `async_remove_entry()`, so
+  removing a zone leaves its report file on disk, unused.
+
 #### Gap 4 — `api.py` first-entry selection, entire REST surface
 
 `_get_coordinator(hass)` (`api.py:72-77`) returns `next(iter(entries.values()))` —
