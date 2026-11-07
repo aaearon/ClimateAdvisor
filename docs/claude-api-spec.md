@@ -20,9 +20,10 @@
 
 ## Scope
 
-- **File:** `custom_components/climate_advisor/claude_api.py`
-- **Approximate line range:** L1 – L1266 (entire file)
-- **Primary entry points:** `ClaudeAPIClient.async_request()` (L278), `ClaudeAPIClient.__init__()` (L215)
+- **File:** `custom_components/climate_advisor/claude_api.py` (plus `ai_backend.py`, `chatgpt_backend.py`, `ai_account.py` for the provider seam; see [Provider Seam](#provider-seam))
+- **Primary entry points:** `ClaudeAPIClient.async_request()`, `ClaudeAPIClient.async_request_streaming()`, `ClaudeAPIClient.__init__()`
+
+**Naming:** `ClaudeAPIClient` and `ClaudeResponse` are provider-neutral despite the names. They are the shared wrapper (circuit breaker, rate limits, status, budget, history) and result type for every provider. The names are kept on purpose (tests and callers import them); a rename is deliberately deferred.
 
 This spec covers `ClaudeAPIClient` and the supporting dataclasses (`ClaudeResponse`, `_CircuitBreaker`, `_RateLimitCounters`, `_BudgetTracker`). It does NOT cover:
 
@@ -61,7 +62,7 @@ After a successful `async_request()` call (`response.success = True`):
 
 After a failed `async_request()` call (`response.success = False`):
 
-7. `self._circuit_breaker.consecutive_failures` has incremented by 1.
+7. `self._circuit_breaker.consecutive_failures` has incremented by 1 (not when the response has `no_retry=True`).
 8. `self._error_count` has incremented by 1.
 9. If `consecutive_failures` now equals or exceeds `AI_CIRCUIT_BREAKER_THRESHOLD` (5), `self._circuit_breaker.state` is `"open"` and `self._circuit_breaker.opened_at` holds the current `time.monotonic()` value.
 10. `self._total_requests` has incremented by 1.
@@ -301,17 +302,13 @@ When `success=False` and all guard flags are `False`, the failure came from insi
 
 ### `__init__()` Config Keys Read
 
-`ClaudeAPIClient.__init__()` reads exactly one config key at construction time:
-
-| Key | Purpose |
-|---|---|
-| `CONF_AI_API_KEY` | Authenticate the `AsyncAnthropic` client |
+`ClaudeAPIClient.__init__(config, client=None)` reads `CONF_AI_PROVIDER` (default `"anthropic"`), looks the id up with `get_provider()` and builds the backend with `spec.build_backend(config, client)`. For the Anthropic backend, `CONF_AI_API_KEY` is the only config key read at construction. For an account provider, `client` is the shared `ChatGPTAccountManager` (passed by reference; no key is read). An unknown provider id logs an error, leaves `_spec`/`_backend` as `None`, and `get_status()` reports `error`; it never fails setup.
 
 All other config keys (`CONF_AI_MODEL`, `CONF_AI_MAX_TOKENS`, etc.) are read lazily at call time from `self._config`. `self._config` is the full HA config-entry data dict stored by reference — live changes made via `update_config()` are immediately visible to subsequent calls.
 
 ### Absent or Empty API Key
 
-If `config.get(CONF_AI_API_KEY, "")` returns an empty string:
+(Anthropic backend; the `_client` below is `AnthropicBackend.client`, exposed on the wrapper as a delegating attribute.) If `config.get(CONF_AI_API_KEY, "")` returns an empty string:
 
 1. `self._client` is set to `None` (no `AsyncAnthropic` is constructed).
 2. A WARNING is logged: "No AI API key configured; Claude API client will not be active".
@@ -337,6 +334,48 @@ If `from anthropic import ...` raises `ImportError`:
 - `async_test_connection()` returns `(False, "anthropic package is not installed")` immediately.
 
 ---
+
+## Provider Seam
+
+`ai_backend.py` holds the provider-neutral contracts and imports no provider. `ClaudeAPIClient` talks to a provider only through the `AIBackend` Protocol and never branches on the provider id; differences come from `ProviderSpec` capability flags.
+
+| Piece | What it is |
+|---|---|
+| `AIBackend` | `async_request(...)`, `async_stream(...)` (yields `{type: text\|thinking\|stop}` events), `async_list_models()` (never raises), `async_fetch_models()` (raises `AIBackendError`; the sign-in readiness probe), `async_test_connection()`, `update_config()`, `for_request()` (the backend one request uses, taken at dispatch; ChatGPT returns a copy bound to the current account), `client`, `inactive_reason` |
+| `AIBackendError(category)` | `auth`, `quota`, `rate_limit`, `transient` or `permanent`; also `timeout` and `model_not_found` flags |
+| `ProviderSpec` (frozen) | `id`, `label`, `display_name` ("Claude AI", "ChatGPT"), `api_name` ("Claude API"; used in logs and the connection error), `credential_kind` (`api_key` or `account`), `build_backend`, `usage_url`, `tracks_cost`, `supports_tuning`, `supports_tier_fallback`, `plan_restricted`, `resolve_request_options`, `list_models`, `validate_credentials`, `settings_fields`, plus optional `uses_claude_wording`, `default_model`, `fallback_models`; required with no default: `credential_setting` (config key of the provider's API key, `None` for an account provider; used by the options flow, settings rows, coordinator gate and diagnostics redaction), `model_setting` (config key of the provider's chosen model; Anthropic `ai_model`, ChatGPT `ai_chatgpt_model`). The options flow builds, validates and saves the model field from `model_setting`; a spec with no `default_model` gets a required, preselected field |
+| `PROVIDERS` / `get_provider(id)` | Registry; unknown or unhashable id returns `None` |
+| `ai_providers.ensure_providers_registered()` | Imports `claude_api` and `chatgpt_backend` so their specs register (`async_` variant keeps first imports off the event loop) |
+
+Built-in specs:
+
+| | `anthropic` | `chatgpt` |
+|---|---|---|
+| Backend | `AnthropicBackend` (in `claude_api.py`, official SDK) | `ChatGPTBackend` (`chatgpt_backend.py`, aiohttp, `https://api.openai.com/v1` only) |
+| `credential_kind` | `api_key` | `account` |
+| `tracks_cost` / `supports_tuning` / `supports_tier_fallback` | true / true / true | false / false / false |
+| `plan_restricted` | false | true (manual-only, connected-owner-only) |
+| Model setting | `ai_model` | `ai_chatgpt_model` (separate, so switching back keeps Claude settings) |
+
+Wrapper behaviour that depends on the flags: budget accumulation and `monthly_cost_estimate` only when `tracks_cost`; tier fallback (`_try_tier_fallback`) only when `supports_tier_fallback`; `check_user_allowed(user_id)` and the manual-only refusal only when `plan_restricted`. `get_status()` adds `provider`, `provider_label`, `usage_url`, `tracks_cost` and `account_state`; for an account provider whose manager is disconnected the status is `not_connected`, and `reauth_required` when it needs a new sign-in.
+
+### ChatGPT backend behaviour
+
+- Request: `instructions` + one `input` user message, `store: false`, `stream: true`. No temperature, no output cap, no `reasoning.effort` (unconfirmed). The `max_tokens`/`temperature`/`reasoning_effort` arguments are accepted and ignored.
+- Text deltas become `text` events, reasoning-summary deltas become `thinking`. `async_request` aggregates the stream into a `ClaudeResponse` with `estimated_cost=0.0`; missing `usage` reports 0 tokens.
+- Only `response.completed` with text is success. `response.failed`, `response.incomplete`, an unreadable frame, a missing terminal event or a network drop raise `ChatGPTBackendError` before the final `stop` event. Comments, event-only blocks, empty data and `[DONE]` are ignored.
+- A refusal, or a completed response with no text, raises with `no_answer` and `no_retry`: the user sees the error, and no report or fallback report is stored.
+- Redirects are never followed (`allow_redirects=False`); any 3xx is a `no_retry` error.
+- A request is bound to the account (owner and subject) it started on, across wrapper retries, 503 backoff and the 401 refresh. If that changes, it stops with a `no_retry` error before anything further is sent.
+- Errors: only the documented plan code `subscription_sharing_usage_limit_exceeded` is `quota` and sets the account-wide cooldown (HTTP 429, or the code in `response.failed` or a stream `error` event). Any other 429, whatever its code or none, and the stream codes `rate_limit_exceeded`, `slow_down` and `rate_limit_error`, are `rate_limit`: no cooldown, not retried, `Retry-After` seconds in the message when present; 401 refreshes the token once, unless the code is `subscription_sharing_invalid_user`, then is classified by the second answer (`auth`); 403 is `permanent` and not retried; 5xx is `transient`; 503 is retried inside the backend up to 2 times with 1 s then 3 s delays. Diagnosis fields (HTTP status, error code, request ID, response shape) are kept; tokens and response bodies never are.
+- The shared account is signed in through the options flow (`ChatGPTAccountManager.async_begin_login` / `async_complete_login`, PKCE; the pasted `127.0.0.1` callback address is parsed, never fetched). See [ai-integration.md](ai-integration.md#setting-up-the-chatgpt-provider).
+- Model list and the sign-in readiness check use `GET /v1/models`, never an inference request. A temporary 429/5xx there is "not ready", not a credential verdict.
+
+### Quota cooldown (account-level)
+
+A plan usage-limit error from any zone calls `set_quota_cooldown`, which pauses every zone's ChatGPT client for `QUOTA_COOLDOWN_SECONDS` (3600). No reset time is assumed from the response. After the cooldown one caller per lease window is granted a probe (`quota_cooldown_active()` returns `False` and starts a saved lease of `QUOTA_PROBE_LEASE_SECONDS` = 900); other callers stay blocked. Only a completed request that passed the gate after the latest cooldown clears it. When a lease ends the cooldown stays and one new probe may go, so a probe that failed for a non-quota reason or is still running proves nothing; a 429 restarts the cooldown. `quota_cooldown_active()` is not a pure read.
+
+**Outside the breaker.** `ClaudeAPIClient` reads only `AIBackendError.no_retry` (default `False`; no provider or category check). On `no_retry` the non-streaming loop returns a failed `ClaudeResponse(no_retry=True)` after one attempt, with no backoff, and the streaming path re-raises at once. Both still increment `error_count` and (non-streaming) record history and `total_requests`, but neither changes `consecutive_failures` or the breaker state. `ChatGPTBackend` sets the flag for every 429-class failure (`quota` and `rate_limit`, HTTP or stream code, including a 429 on token refresh), the early refusal under active cooldown, and `auth` with `reauth_required`. `AnthropicBackend` never sets it, so its 402 (`quota`) is retried and counted as before.
 
 ## Error Conditions
 
@@ -371,7 +410,7 @@ If `from anthropic import ...` raises `ImportError`:
 - [`_check_budget`](../custom_components/climate_advisor/claude_api.py#L817) — month-roll detection and cap check
 - [`_check_rate_limit`](../custom_components/climate_advisor/claude_api.py#L744) — daily counter check for `"auto"` vs `"manual"` callers
 - [`check_investigator_rate_limit`](../custom_components/climate_advisor/claude_api.py#L761) — separate investigator gate; also checks `CONF_AI_INVESTIGATOR_ENABLED`
-- [`update_config`](../custom_components/climate_advisor/claude_api.py#L718) — updates config in place; **not called from production code** — every real config change goes through `async_reload()` instead
+- [`update_config`](../custom_components/climate_advisor/claude_api.py#L718) — updates config in place, and rebuilds the backend when the provider changes (the optional second argument is what the new backend is given, as in `__init__`). The only production caller is `coordinator.async_apply_ai_settings()`, from the account-provider options steps; every other config change goes through `async_reload()`. A request pins the spec and backend at dispatch, so one already running finishes on the provider, cost accounting and retries it started with. `requester_id` (from the investigate view) is rechecked with `check_user_allowed` at dispatch, with no await before the backend call; a refusal raises `AIUserNotAllowedError`: 403 on the non-streaming path, a terminal SSE error event with `status: 403` on the streaming path, whose 200 headers are already sent
 - [`get_persistent_stats`](../custom_components/climate_advisor/claude_api.py#L652) — serializes counters + monthly cost for HA state persistence
 - [`restore_persistent_stats`](../custom_components/climate_advisor/claude_api.py#L674) — rehydrates counters after HA restart or config reload
 - [`ClaudeResponse`](../custom_components/climate_advisor/claude_api.py#L95) — response dataclass; all fields documented above
