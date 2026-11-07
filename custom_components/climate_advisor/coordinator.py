@@ -844,7 +844,6 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self.claude_client: ClaudeAPIClient | None = None
         self.ai_skills: AISkillRegistry | None = None
         self._investigation_report_history: list[dict] = []
-        self._investigation_report_save_lock = threading.Lock()
         self._ai_client_config: dict[str, Any] | None = None
         if config.get(CONF_AI_ENABLED) and config.get(CONF_AI_API_KEY):
             from .ai_skills import AISkillRegistry as _AISkillRegistry
@@ -2529,9 +2528,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         filepath = self._investigation_reports_path()
         tmp_path = filepath + ".tmp"
-        # Saves in a zone can overlap and share tmp_path. Copying inside the lock means the last save writes the newest
-        # list; the event loop changes the list while this runs, and list() is atomic against that.
-        with self._investigation_report_save_lock:
+        # Saves to a zone's file can overlap and share tmp_path, including from an old instance during a reload, so the
+        # lock is per file, not per instance. Copying inside it means the last save writes its newest list; the event
+        # loop changes the list while this runs, and list() is atomic against that. Never taken with the migration gate.
+        with self.hass.data.setdefault("climate_advisor_report_save_locks", {}).setdefault(filepath, threading.Lock()):
             try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(list(self._investigation_report_history), f, indent=2, default=str)

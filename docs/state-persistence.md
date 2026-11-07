@@ -128,6 +128,8 @@ Order in `async_restore_state()`: load the state file; split any old shared repo
 
 The shared-file split runs at most once per Home Assistant run, before any zone loads its reports, and stages everything first, so a failure before the zone files are replaced changes none of them. Until the next start the old reports stay unlisted, zones save to their own files as normal, and that start merges both. One window remains, with no tombstones to close it: if the process stops or a replace fails while the zone files are being replaced, or the shared file can't be removed afterwards, a report deleted before the next start is merged back by that start's attempt.
 
+Saves to a zone's reports file take one lock per file, held in `hass.data`, so overlapping saves can't corrupt it, including a save from the zone's old instance during a reload. That old instance's list can still be stale: if its save runs last, it can bring back a report deleted through the new instance.
+
 | State key / data | Restored on | Issue | Why |
 |---|---|---|---|
 | `ai_stats`, `promise_stats`, `sensor_last_real_reading`, coordinator health fields | any restart | #81 (`ai_stats`), #1128 (`promise_stats`), #1181 (`sensor_last_real_reading`), #480 (health) | Counters and health, not "today's" plan |

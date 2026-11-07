@@ -10,7 +10,7 @@ import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,7 +43,6 @@ def _zone(config_dir: Path, entry_id: str, climate_entity: str = "climate.any"):
     coord._entry_id = entry_id
     coord.config = {"climate_entity": climate_entity}
     coord._investigation_report_history = []
-    coord._investigation_report_save_lock = Lock()
     coord._load_investigation_reports()
     return coord
 
@@ -123,6 +122,43 @@ class TestZonesKeepTheirOwnReports:
         saved = json.loads(_scoped(tmp_path, "entry_a").read_text())
         assert [e["result"]["text"] for e in saved] == ["keep"]
         assert _texts(_zone(tmp_path, "entry_a")) == ["keep"]
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_two_instances_of_one_zone_saving_at_once_keep_the_file_valid(self, tmp_path, monkeypatch):
+        """During a reload, a running investigation can still save through the old instance of the zone."""
+        old_instance, new_instance = _zone(tmp_path, "entry_a"), _zone(tmp_path, "entry_a")
+        new_instance.hass.data = old_instance.hass.data
+        new_instance._investigation_report_history = [
+            {"timestamp": datetime.now(UTC).isoformat(), "result": {"text": "from the new instance"}}
+        ]
+        real_dump = json.dump
+        first_save_writing, release_first_save = Event(), Event()
+
+        def _hold_first_save(*args, **kwargs):
+            if not first_save_writing.is_set():
+                first_save_writing.set()
+                release_first_save.wait(timeout=5)
+            real_dump(*args, **kwargs)
+
+        monkeypatch.setattr(json, "dump", _hold_first_save)
+        first = Thread(target=old_instance._save_investigation_reports)
+        second = Thread(target=new_instance._save_investigation_reports)
+
+        first.start()
+        assert first_save_writing.wait(timeout=5)
+        second.start()
+        # Unfixed, the second save finishes here and the first then writes into the same file. Fixed, it waits, so
+        # this bounded wait only delays the test and can't fail it.
+        second.join(timeout=0.2)
+        release_first_save.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        monkeypatch.undo()
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        saved = json.loads(_scoped(tmp_path, "entry_a").read_text())
+        assert [e["result"]["text"] for e in saved] == ["from the new instance"]
         assert not list(tmp_path.glob("*.tmp"))
 
 
