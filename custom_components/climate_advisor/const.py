@@ -20,7 +20,13 @@ CONF_GITHUB_REPO = "github_repo"
 # or dump_diagnostics log). Not CONFIG_METADATA "sensitive" flags: that dict also drives the
 # Settings tab and the suggestion-accept write allowlist, which a secret must not join.
 # ai_api_key is covered by its CONFIG_METADATA "sensitive" flag; diagnostics.TO_REDACT unions both.
-REDACTED_CONFIG_KEYS = frozenset({"notify_service", CONF_GITHUB_TOKEN})
+# The ChatGPT account tokens live in the account manager's Store, never in entry data; the token
+# key names are listed so a stray copy in any dumped config or status dict is still redacted.
+AI_ACCOUNT_TOKEN_KEYS = frozenset({"access_token", "refresh_token", "id_token", "ai_access_token", "ai_refresh_token"})
+REDACTED_CONFIG_KEYS = frozenset({"notify_service", CONF_GITHUB_TOKEN}) | AI_ACCOUNT_TOKEN_KEYS
+# hass.data key of the shared ChatGPT account manager. Deliberately NOT under hass.data[DOMAIN],
+# which must hold only coordinators.
+AI_ACCOUNT_HASS_KEY = "climate_advisor_ai_account"
 API_SUBMIT_GITHUB_ISSUE = "/api/climate_advisor/submit_github_issue"
 
 # Default setpoints (°F) — reformatted to match a real, tuned installation's own
@@ -1736,6 +1742,8 @@ ATTR_FORECAST_BIAS_CONFIDENCE = "forecast_bias_confidence"
 # Config keys
 CONF_AI_ENABLED = "ai_enabled"
 CONF_AI_API_KEY = "ai_api_key"
+CONF_AI_PROVIDER = "ai_provider"
+CONF_AI_CHATGPT_MODEL = "ai_chatgpt_model"
 CONF_AI_MODEL = "ai_model"
 CONF_AI_REASONING_EFFORT = "ai_reasoning_effort"
 CONF_AI_MAX_TOKENS = "ai_max_tokens"
@@ -1751,6 +1759,7 @@ CONF_AI_INVESTIGATOR_RPD = "ai_investigator_requests_per_day"
 
 # Defaults
 DEFAULT_AI_ENABLED = False
+DEFAULT_AI_PROVIDER = "anthropic"
 DEFAULT_AI_MODEL = "claude-sonnet-5"
 DEFAULT_AI_REASONING_EFFORT = "low"
 DEFAULT_AI_MAX_TOKENS = 4096
